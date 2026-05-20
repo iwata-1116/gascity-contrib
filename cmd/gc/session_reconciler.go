@@ -36,6 +36,17 @@ type wakeTarget struct {
 	alive   bool
 }
 
+func lifecycleTimerBlocker(metadata map[string]string, now time.Time) string {
+	switch {
+	case metadataTimeInFuture(metadata["held_until"], now):
+		return "user_hold"
+	case metadataTimeInFuture(metadata["quarantined_until"], now):
+		return "quarantine"
+	default:
+		return ""
+	}
+}
+
 // buildDepsMap extracts template dependency edges from config for topo ordering.
 // Maps template QualifiedName -> list of dependency template QualifiedNames.
 func buildDepsMap(cfg *config.City) map[string][]string {
@@ -1554,13 +1565,14 @@ func reconcileSessionBeadsTracedWithNamedDemand(
 		if maxAgeTr != nil && alive {
 			creationCompleteAt, hasAnchor := parseRFC3339Metadata(session.Metadata["creation_complete_at"])
 			if hasAnchor && maxAgeTr.shouldRestart(name, creationCompleteAt, clk.Now()) {
+				blocker := lifecycleTimerBlocker(session.Metadata, clk.Now())
 				switch {
-				case metadataTimeInFuture(session.Metadata["held_until"], clk.Now()):
-					// Respect user-hold: a future held_until means an operator
-					// explicitly suspended the session. Bypass the max-age
-					// restart so SleepPatch does not clobber held_until.
+				case blocker != "":
+					// Respect lifecycle timer blockers already enforced by
+					// wake evaluation. Bypass the max-age restart so
+					// SleepPatch does not rewrite the intended sleep state.
 					if trace != nil {
-						trace.recordDecision("reconciler.session.max_session_age", tp.TemplateName, name, "user_hold", "deferred_user_hold", nil, nil, "")
+						trace.recordDecision("reconciler.session.max_session_age", tp.TemplateName, name, blocker, "deferred_"+blocker, nil, nil, "")
 					}
 				case pendingInteractionKeepsAwake(*session, sp, name, clk):
 					if trace != nil {
@@ -1611,19 +1623,17 @@ func reconcileSessionBeadsTracedWithNamedDemand(
 
 		// Idle timeout: restart sessions idle longer than configured threshold.
 		if it != nil && alive && it.checkIdle(name, sp, clk.Now()) {
-			if metadataTimeInFuture(session.Metadata["held_until"], clk.Now()) {
-				// Respect user-hold: skip the idle-timeout kill (and the
-				// drain-cancel side effect of the pending branch) so
-				// SleepPatch does not clear held_until. Matches the
-				// pending-interaction branch's `continue` semantics — a
-				// held session does not participate in this tick's wake
-				// decision.
+			blocker := lifecycleTimerBlocker(session.Metadata, clk.Now())
+			switch {
+			case blocker != "":
+				// Respect lifecycle timer blockers without skipping the
+				// post-loop wake/drain pass. A metadata-only suspend uses
+				// sleep_intent=user-hold and still needs that pass to drain
+				// the live runtime.
 				if trace != nil {
-					trace.recordDecision("reconciler.session.idle_timeout", tp.TemplateName, name, "user_hold", "deferred_user_hold", nil, nil, "")
+					trace.recordDecision("reconciler.session.idle_timeout", tp.TemplateName, name, blocker, "deferred_"+blocker, nil, nil, "")
 				}
-				continue
-			}
-			if pendingInteractionKeepsAwake(*session, sp, name, clk) {
+			case pendingInteractionKeepsAwake(*session, sp, name, clk):
 				drainCancelled := false
 				if dt != nil {
 					drainCancelled = cancelSessionDrain(*session, sp, dt)
@@ -1634,33 +1644,34 @@ func reconcileSessionBeadsTracedWithNamedDemand(
 					}, nil, "")
 				}
 				continue
-			}
-			fmt.Fprintf(stderr, "session reconciler: idle timeout for %s\n", tp.DisplayName()) //nolint:errcheck // best-effort stderr
-			if trace != nil {
-				trace.recordDecision("reconciler.session.idle_timeout", tp.TemplateName, name, "idle_timeout", "stop", nil, nil, "")
-			}
-			if err := workerKillSessionTargetWithConfig("", store, sp, cfg, name); err != nil {
-				fmt.Fprintf(stderr, "session reconciler: stopping idle %s: %v\n", name, err) //nolint:errcheck // best-effort stderr
-			} else {
-				_ = sp.ClearScrollback(name)
-				rec.Record(events.Event{
-					Type:    events.SessionIdleKilled,
-					Actor:   "gc",
-					Subject: tp.DisplayName(),
-				})
-				telemetry.RecordAgentIdleKill(context.Background(), tp.DisplayName())
-				// Mark for immediate re-wake on this same tick by clearing
-				// last_woke_at and setting state to asleep. The wake logic
-				// below will pick it up.
-				batch := sessionpkg.SleepPatch(clk.Now(), "idle-timeout")
-				_ = store.SetMetadataBatch(session.ID, batch)
-				if session.Metadata == nil {
-					session.Metadata = make(map[string]string, len(batch))
+			default:
+				fmt.Fprintf(stderr, "session reconciler: idle timeout for %s\n", tp.DisplayName()) //nolint:errcheck // best-effort stderr
+				if trace != nil {
+					trace.recordDecision("reconciler.session.idle_timeout", tp.TemplateName, name, "idle_timeout", "stop", nil, nil, "")
 				}
-				for key, value := range batch {
-					session.Metadata[key] = value
+				if err := workerKillSessionTargetWithConfig("", store, sp, cfg, name); err != nil {
+					fmt.Fprintf(stderr, "session reconciler: stopping idle %s: %v\n", name, err) //nolint:errcheck // best-effort stderr
+				} else {
+					_ = sp.ClearScrollback(name)
+					rec.Record(events.Event{
+						Type:    events.SessionIdleKilled,
+						Actor:   "gc",
+						Subject: tp.DisplayName(),
+					})
+					telemetry.RecordAgentIdleKill(context.Background(), tp.DisplayName())
+					// Mark for immediate re-wake on this same tick by clearing
+					// last_woke_at and setting state to asleep. The wake logic
+					// below will pick it up.
+					batch := sessionpkg.SleepPatch(clk.Now(), "idle-timeout")
+					_ = store.SetMetadataBatch(session.ID, batch)
+					if session.Metadata == nil {
+						session.Metadata = make(map[string]string, len(batch))
+					}
+					for key, value := range batch {
+						session.Metadata[key] = value
+					}
+					alive = false
 				}
-				alive = false
 			}
 			// Fall through to wakeReasons — it will re-wake immediately if config present
 		}
