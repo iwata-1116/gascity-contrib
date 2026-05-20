@@ -247,6 +247,24 @@ get_sql_rows() {
     SQL_ROWS_RESULT=$(printf '%s\n' "$output" | tail -n +2 | tr -d '\r')
 }
 
+has_split_dependency_target_columns() {
+    local db="$1"
+    local output
+    local fields
+
+    if ! output=$(dolt_sql -r csv -q "SHOW COLUMNS FROM \`$db\`.dependencies" 2>/dev/null); then
+        return 0
+    fi
+
+    fields=$(printf '%s\n' "$output" | tail -n +2 | cut -d, -f1 | tr -d '\r')
+    if [ -z "$fields" ]; then
+        return 0
+    fi
+
+    printf '%s\n' "$fields" | grep -qx 'depends_on_issue_id' || return 1
+    printf '%s\n' "$fields" | grep -qx 'depends_on_wisp_id' || return 1
+}
+
 SQL_CHANGE_ROWS_RESULT=0
 close_city_issue() {
     local issue_id="$1"
@@ -309,6 +327,10 @@ while IFS= read -r DB; do
         # Not a bd-managed bead store. Skip silently; recording an
         # anomaly here would just turn every schemaless DB on the
         # server into noise. See gastownhall/gascity#1816.
+        continue
+    fi
+    if ! has_split_dependency_target_columns "$DB"; then
+        record_anomaly "$DB" "dependencies table lacks split target columns; dependency-aware reaper queries skipped"
         continue
     fi
 
@@ -436,6 +458,7 @@ while IFS= read -r DB; do
             SELECT DISTINCT d.depends_on_issue_id FROM \`$DB\`.dependencies d
             INNER JOIN \`$DB\`.issues i ON d.issue_id = i.id
             WHERE i.status IN ('open', 'in_progress')
+            AND d.depends_on_issue_id IS NOT NULL
         )
     "
     STALE_IDS=$SQL_ROWS_RESULT
