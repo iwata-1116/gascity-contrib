@@ -1554,11 +1554,19 @@ func reconcileSessionBeadsTracedWithNamedDemand(
 		if maxAgeTr != nil && alive {
 			creationCompleteAt, hasAnchor := parseRFC3339Metadata(session.Metadata["creation_complete_at"])
 			if hasAnchor && maxAgeTr.shouldRestart(name, creationCompleteAt, clk.Now()) {
-				if pendingInteractionKeepsAwake(*session, sp, name, clk) {
+				switch {
+				case metadataTimeInFuture(session.Metadata["held_until"], clk.Now()):
+					// Respect user-hold: a future held_until means an operator
+					// explicitly suspended the session. Bypass the max-age
+					// restart so SleepPatch does not clobber held_until.
+					if trace != nil {
+						trace.recordDecision("reconciler.session.max_session_age", tp.TemplateName, name, "user_hold", "deferred_user_hold", nil, nil, "")
+					}
+				case pendingInteractionKeepsAwake(*session, sp, name, clk):
 					if trace != nil {
 						trace.recordDecision("reconciler.session.max_session_age", tp.TemplateName, name, "pending", "deferred_pending", nil, nil, "")
 					}
-				} else {
+				default:
 					hasWork, assignedErr := sessionHasOpenAssignedWorkForReachableStore(cityPath, cfg, store, rigStores, *session)
 					if assignedErr != nil {
 						// Fail closed: treat error as "has work" so a transient
@@ -1603,6 +1611,18 @@ func reconcileSessionBeadsTracedWithNamedDemand(
 
 		// Idle timeout: restart sessions idle longer than configured threshold.
 		if it != nil && alive && it.checkIdle(name, sp, clk.Now()) {
+			if metadataTimeInFuture(session.Metadata["held_until"], clk.Now()) {
+				// Respect user-hold: skip the idle-timeout kill (and the
+				// drain-cancel side effect of the pending branch) so
+				// SleepPatch does not clear held_until. Matches the
+				// pending-interaction branch's `continue` semantics — a
+				// held session does not participate in this tick's wake
+				// decision.
+				if trace != nil {
+					trace.recordDecision("reconciler.session.idle_timeout", tp.TemplateName, name, "user_hold", "deferred_user_hold", nil, nil, "")
+				}
+				continue
+			}
 			if pendingInteractionKeepsAwake(*session, sp, name, clk) {
 				drainCancelled := false
 				if dt != nil {

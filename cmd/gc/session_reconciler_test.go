@@ -5587,6 +5587,58 @@ func TestReconcileSessionBeads_IdleTimeoutStopsAndStaysAsleep(t *testing.T) {
 	}
 }
 
+// TestReconcileSessionBeads_IdleTimeoutRespectsUserHold guards the
+// session_reconciler.go idle-timeout block: a session with a future
+// held_until (set by `gc session suspend`) must not be idle-killed.
+// Without the guard, SleepPatch overwrites bead metadata and clears
+// held_until, silently un-suspending the session.
+func TestReconcileSessionBeads_IdleTimeoutRespectsUserHold(t *testing.T) {
+	env := newReconcilerTestEnv()
+	env.cfg = &config.City{Agents: []config.Agent{{Name: "worker"}}}
+	env.addDesired("worker", "worker", true)
+	session := env.createSessionBead("worker", "worker")
+	env.markSessionActive(&session)
+	heldUntil := env.clk.Now().Add(100 * time.Hour).UTC().Format(time.RFC3339)
+	env.setSessionMetadata(&session, map[string]string{
+		"held_until": heldUntil,
+	})
+	if err := env.sp.SetMeta("worker", "GC_SESSION_ID", session.ID); err != nil {
+		t.Fatalf("SetMeta(GC_SESSION_ID): %v", err)
+	}
+
+	it := newFakeIdleTracker()
+	it.idle["worker"] = true
+
+	rec := events.NewFake()
+	env.rec = rec
+
+	cfgNames := configuredSessionNames(env.cfg, "", env.store)
+	reconcileSessionBeads(
+		context.Background(), []beads.Bead{session}, env.desiredState, cfgNames,
+		env.cfg, env.sp, env.store, nil, nil, nil, env.dt, map[string]int{}, false, nil, "",
+		it, env.clk, env.rec, 0, 0, &env.stdout, &env.stderr,
+	)
+
+	if !env.sp.IsRunning("worker") {
+		t.Error("held worker must not be idle-killed while held_until is in the future")
+	}
+	b, err := env.store.Get(session.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if b.Metadata["sleep_reason"] == "idle-timeout" {
+		t.Errorf("sleep_reason = %q, must not be idle-timeout for held session", b.Metadata["sleep_reason"])
+	}
+	if got := b.Metadata["held_until"]; got != heldUntil {
+		t.Errorf("held_until = %q, want preserved %q", got, heldUntil)
+	}
+	for _, e := range rec.Events {
+		if e.Type == events.SessionIdleKilled {
+			t.Error("SessionIdleKilled must not fire while held_until is in the future")
+		}
+	}
+}
+
 func TestReconcileSessionBeads_IdleTimeoutNilTrackerSkipped(t *testing.T) {
 	env := newReconcilerTestEnv()
 	env.cfg = &config.City{Agents: []config.Agent{{Name: "worker"}}}
@@ -5664,6 +5716,50 @@ func TestReconcileSessionBeads_MaxSessionAgeKillsAgedSession(t *testing.T) {
 	}
 	if !fired {
 		t.Error("expected SessionMaxAgeKilled event")
+	}
+}
+
+// TestReconcileSessionBeads_MaxSessionAgeRespectsUserHold guards the
+// session_reconciler.go max-session-age block: a session with a future
+// held_until (set by `gc session suspend`) must not be max-age killed.
+// Without the guard, SleepPatch overwrites bead metadata and clears
+// held_until, silently un-suspending the session.
+func TestReconcileSessionBeads_MaxSessionAgeRespectsUserHold(t *testing.T) {
+	env := newReconcilerTestEnv()
+	env.cfg = &config.City{Agents: []config.Agent{{Name: "witness", MaxSessionAge: "5h"}}}
+	env.addDesired("witness", "witness", true)
+	session := env.createSessionBead("witness", "witness")
+	env.markSessionActive(&session)
+	heldUntil := env.clk.Now().Add(100 * time.Hour).UTC().Format(time.RFC3339)
+	env.setSessionMetadata(&session, map[string]string{
+		"creation_complete_at": env.clk.Now().Add(-6 * time.Hour).UTC().Format(time.RFC3339),
+		"held_until":           heldUntil,
+	})
+
+	tr := newMaxSessionAgeTracker()
+	tr.setConfig("witness", 5*time.Hour, 0)
+	rec := events.NewFake()
+	env.rec = rec
+
+	env.maxAgeReconcile([]beads.Bead{session}, tr)
+
+	if !env.sp.IsRunning("witness") {
+		t.Error("held witness must not be max-age killed while held_until is in the future")
+	}
+	b, err := env.store.Get(session.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if b.Metadata["sleep_reason"] == "max-session-age" {
+		t.Errorf("sleep_reason = %q, must not be max-session-age for held session", b.Metadata["sleep_reason"])
+	}
+	if got := b.Metadata["held_until"]; got != heldUntil {
+		t.Errorf("held_until = %q, want preserved %q", got, heldUntil)
+	}
+	for _, e := range rec.Events {
+		if e.Type == events.SessionMaxAgeKilled {
+			t.Error("SessionMaxAgeKilled must not fire while held_until is in the future")
+		}
 	}
 }
 
