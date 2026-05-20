@@ -501,15 +501,11 @@ func LoadWithIncludesOptions(fs fsys.FS, path string, opts LoadOptions, extraInc
 		}
 	}
 
-	// Apply patches after all fragments are merged + city packs expanded.
-	if !root.Patches.IsEmpty() {
-		if err := ApplyPatches(root, root.Patches); err != nil {
-			return nil, nil, fmt.Errorf("applying patches: %w", err)
-		}
-		root.Patches = Patches{} // clear after application
-	}
-
-	// Expand rig packs after patches (pack agents get rig overrides).
+	// Expand rig packs so the merged agent list (city- and rig-scope) is
+	// complete before patches are applied. Rig pack expansion uses
+	// rig.Overrides and pack-internal patches (which are different from
+	// city-level [[patches]]); none of those depend on city-level patches
+	// having been applied first.
 	rigFormulaDirs := make(map[string][]string)
 	if HasPackRigs(root.Rigs) {
 		if err := expandPacks(root, fs, cityRoot, rigFormulaDirs, opts); err != nil {
@@ -531,6 +527,17 @@ func LoadWithIncludesOptions(fs fsys.FS, path string, opts LoadOptions, extraInc
 				}
 			}
 		}
+	}
+
+	// Apply patches after all packs (city and rig) are expanded so that
+	// [[patches.agent]] blocks in city.toml can target pack-derived
+	// rig-scope agents (e.g., dir="rig" name="gastown.refinery"), not
+	// just city-scope agents.
+	if !root.Patches.IsEmpty() {
+		if err := ApplyPatches(root, root.Patches); err != nil {
+			return nil, nil, fmt.Errorf("applying patches: %w", err)
+		}
+		root.Patches = Patches{} // clear after application
 	}
 
 	// Apply [global] sections from packs to agents in scope.

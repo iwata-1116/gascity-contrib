@@ -267,6 +267,115 @@ name = "witness"
 	}
 }
 
+// TestLoadWithIncludes_PatchTargetsRigPackDerivedAgent verifies that a
+// city-level [[patches.agent]] block can target a rig-scope agent that
+// comes from a rig pack via [rigs.imports.<binding>]. The merged agent's
+// canonical identity is "rig/binding.name" (e.g., "proj/gs.refinery"),
+// and patches keyed by dir="rig" name="binding.name" must resolve to it.
+//
+// Regression for gco-dma / HQ gc-t2c: city-level patches were applied
+// before rig pack expansion, so the target agent didn't exist in
+// cfg.Agents when ApplyPatches ran and every form of [[patches.agent]]
+// pointing at a rig pack agent failed with "not found in merged config".
+func TestLoadWithIncludes_PatchTargetsRigPackDerivedAgent(t *testing.T) {
+	dir := t.TempDir()
+	writeFile(t, dir, "city.toml", `
+[workspace]
+name = "test"
+
+[[rigs]]
+name = "proj"
+path = "/tmp/proj"
+
+[rigs.imports.gs]
+source = "./packs/gastown"
+
+[[patches.agent]]
+dir = "proj"
+name = "gs.refinery"
+suspended = true
+`)
+	writeFile(t, dir, "packs/gastown/pack.toml", `
+[pack]
+name = "gastown"
+schema = 2
+
+[[agent]]
+name = "refinery"
+scope = "rig"
+`)
+
+	cfg, _, err := LoadWithIncludes(fsys.OSFS{}, filepath.Join(dir, "city.toml"))
+	if err != nil {
+		t.Fatalf("LoadWithIncludes: %v", err)
+	}
+
+	var refinery *Agent
+	for i := range cfg.Agents {
+		if cfg.Agents[i].QualifiedName() == "proj/gs.refinery" {
+			refinery = &cfg.Agents[i]
+			break
+		}
+	}
+	if refinery == nil {
+		names := make([]string, 0, len(cfg.Agents))
+		for _, a := range cfg.Agents {
+			names = append(names, a.QualifiedName())
+		}
+		t.Fatalf("agent proj/gs.refinery not found in merged config; agents: %v", names)
+	}
+	if !refinery.Suspended {
+		t.Errorf("refinery.Suspended = false, want true (patch should have applied)")
+	}
+}
+
+// TestLoadWithIncludes_PatchTargetingMissingRigAgentStillErrors verifies
+// that a misspelled [[patches.agent]] target still produces a clear
+// "not found in merged config" error after the ordering fix. Without
+// this check, the swap could mask typos by silently no-oping if the
+// patch list ever became deferral-friendly. The merged config sees both
+// city-scope and rig-scope pack agents, so the available-agents list in
+// the error includes the rig-pack agent the user probably meant.
+func TestLoadWithIncludes_PatchTargetingMissingRigAgentStillErrors(t *testing.T) {
+	dir := t.TempDir()
+	writeFile(t, dir, "city.toml", `
+[workspace]
+name = "test"
+
+[[rigs]]
+name = "proj"
+path = "/tmp/proj"
+
+[rigs.imports.gs]
+source = "./packs/gastown"
+
+[[patches.agent]]
+dir = "proj"
+name = "gs.nonexistent"
+suspended = true
+`)
+	writeFile(t, dir, "packs/gastown/pack.toml", `
+[pack]
+name = "gastown"
+schema = 2
+
+[[agent]]
+name = "refinery"
+scope = "rig"
+`)
+
+	_, _, err := LoadWithIncludes(fsys.OSFS{}, filepath.Join(dir, "city.toml"))
+	if err == nil {
+		t.Fatal("expected LoadWithIncludes to fail for nonexistent patch target")
+	}
+	if !strings.Contains(err.Error(), "proj/gs.nonexistent") {
+		t.Errorf("error = %q, want mention of proj/gs.nonexistent", err)
+	}
+	if !strings.Contains(err.Error(), "not found") {
+		t.Errorf("error = %q, want mention of 'not found'", err)
+	}
+}
+
 func TestExpandPacks_OverrideNotFound(t *testing.T) {
 	dir := t.TempDir()
 	writeFile(t, dir, "packs/gt/pack.toml", `
