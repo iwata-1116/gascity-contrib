@@ -2818,8 +2818,8 @@ gc session pin <session-id-or-alias> [flags]
 
 Close dormant sessions older than a given age. By default only
 suspended sessions are affected — active sessions are never pruned. Pass
---state to opt asleep sessions (e.g. drained pool workers) into the same
-cleanup pass; multiple states may be comma-separated.
+--state to opt asleep or drained sessions into the same cleanup pass; multiple
+states may be comma-separated.
 
 ```
 gc session prune [flags]
@@ -2830,14 +2830,14 @@ gc session prune [flags]
 ```
 gc session prune --before 7d
   gc session prune --before 24h
-  gc session prune --state asleep,suspended --before 1h
+  gc session prune --state asleep,suspended,drained --before 1h
 ```
 
 | Flag | Type | Default | Description |
 |------|------|---------|-------------|
 | `--before` | string | `7d` | prune sessions older than this duration (e.g., 7d, 24h) |
 | `--json` | bool |  | emit JSONL |
-| `--state` | string | `suspended` | comma-separated states to prune (suspended, asleep) |
+| `--state` | string | `suspended` | comma-separated states to prune (suspended, asleep, drained) |
 
 ## gc session rename
 

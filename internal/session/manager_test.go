@@ -2575,6 +2575,77 @@ func TestPruneDetailedAsleepUsesSleptAt(t *testing.T) {
 	}
 }
 
+func TestPruneDetailedSkipsAsleepWithoutValidSleptAt(t *testing.T) {
+	store := beads.NewMemStore()
+	sp := runtime.NewFake()
+	mgr := NewManager(store, sp)
+
+	missing, err := mgr.Create(context.Background(), "default", "Missing SleptAt", "echo m", "/tmp", "test", nil, ProviderResume{}, runtime.Config{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SetMetadata(missing.ID, "state", string(StateAsleep)); err != nil {
+		t.Fatal(err)
+	}
+
+	malformed, err := mgr.Create(context.Background(), "default", "Malformed SleptAt", "echo b", "/tmp", "test", nil, ProviderResume{}, runtime.Config{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SetMetadata(malformed.ID, "state", string(StateAsleep)); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SetMetadata(malformed.ID, "slept_at", "not-a-time"); err != nil {
+		t.Fatal(err)
+	}
+
+	result, err := mgr.PruneDetailed(time.Now().Add(time.Hour), StateAsleep)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Count != 0 {
+		t.Fatalf("prune count = %d, want 0; pruned=%v", result.Count, result.SessionIDs)
+	}
+}
+
+func TestPruneDetailedDrainedOptInUsesDrainAt(t *testing.T) {
+	store := beads.NewMemStore()
+	sp := runtime.NewFake()
+	mgr := NewManager(store, sp)
+
+	old, err := mgr.Create(context.Background(), "default", "Old Drained", "echo o", "/tmp", "test", nil, ProviderResume{}, runtime.Config{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SetMetadata(old.ID, "state", string(StateDrained)); err != nil {
+		t.Fatal(err)
+	}
+	tenDaysAgo := time.Now().Add(-10 * 24 * time.Hour).UTC().Format(time.RFC3339)
+	if err := store.SetMetadata(old.ID, "drain_at", tenDaysAgo); err != nil {
+		t.Fatal(err)
+	}
+
+	missing, err := mgr.Create(context.Background(), "default", "Missing DrainAt", "echo m", "/tmp", "test", nil, ProviderResume{}, runtime.Config{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SetMetadata(missing.ID, "state", string(StateDrained)); err != nil {
+		t.Fatal(err)
+	}
+
+	cutoff := time.Now().Add(-7 * 24 * time.Hour)
+	result, err := mgr.PruneDetailed(cutoff, StateDrained)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Count != 1 {
+		t.Fatalf("prune count = %d, want 1; pruned=%v", result.Count, result.SessionIDs)
+	}
+	if len(result.SessionIDs) != 1 || result.SessionIDs[0] != old.ID {
+		t.Fatalf("pruned %v, want [%s]", result.SessionIDs, old.ID)
+	}
+}
+
 func TestSendResumesSuspendedSession(t *testing.T) {
 	store := beads.NewMemStore()
 	sp := runtime.NewFake()

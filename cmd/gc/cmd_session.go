@@ -1621,11 +1621,11 @@ func newSessionPruneCmd(stdout, stderr io.Writer) *cobra.Command {
 		Short: "Close old dormant sessions",
 		Long: `Close dormant sessions older than a given age. By default only
 suspended sessions are affected — active sessions are never pruned. Pass
---state to opt asleep sessions (e.g. drained pool workers) into the same
-cleanup pass; multiple states may be comma-separated.`,
+--state to opt asleep or drained sessions into the same cleanup pass; multiple
+states may be comma-separated.`,
 		Example: `  gc session prune --before 7d
   gc session prune --before 24h
-  gc session prune --state asleep,suspended --before 1h`,
+  gc session prune --state asleep,suspended,drained --before 1h`,
 		Args: cobra.NoArgs,
 		RunE: func(_ *cobra.Command, _ []string) error {
 			if cmdSessionPrune(beforeStr, statesStr, stdout, stderr, jsonOutput) != 0 {
@@ -1635,7 +1635,7 @@ cleanup pass; multiple states may be comma-separated.`,
 		},
 	}
 	cmd.Flags().StringVar(&beforeStr, "before", "7d", "prune sessions older than this duration (e.g., 7d, 24h)")
-	cmd.Flags().StringVar(&statesStr, "state", "suspended", "comma-separated states to prune (suspended, asleep)")
+	cmd.Flags().StringVar(&statesStr, "state", "suspended", "comma-separated states to prune (suspended, asleep, drained)")
 	cmd.Flags().BoolVar(&jsonOutput, "json", false, "emit JSONL")
 	return cmd
 }
@@ -1685,6 +1685,7 @@ func cmdSessionPrune(beforeStr, statesStr string, stdout, stderr io.Writer, json
 			Count:  &result.Count,
 			Before: beforeStr,
 			Cutoff: cutoff.UTC().Format(time.RFC3339),
+			State:  formatPruneStates(states),
 		}); err != nil {
 			fmt.Fprintf(stderr, "gc session prune: %v\n", err) //nolint:errcheck // best-effort stderr
 			return 1
@@ -1701,8 +1702,8 @@ func cmdSessionPrune(beforeStr, statesStr string, stdout, stderr io.Writer, json
 
 // parsePruneStates parses a comma-separated list of session state names
 // for `gc session prune --state`. Only terminal-dormant states are accepted
-// (suspended, asleep) — active or in-flight states are rejected to keep the
-// prune pass safe.
+// (suspended, asleep, drained) — active or in-flight states are rejected to
+// keep the prune pass safe.
 func parsePruneStates(s string) ([]worker.SessionState, error) {
 	if strings.TrimSpace(s) == "" {
 		return nil, fmt.Errorf("--state must not be empty")
@@ -1720,8 +1721,10 @@ func parsePruneStates(s string) ([]worker.SessionState, error) {
 			st = worker.SessionStateSuspended
 		case string(worker.SessionStateAsleep):
 			st = worker.SessionStateAsleep
+		case string(worker.SessionStateDrained):
+			st = worker.SessionStateDrained
 		default:
-			return nil, fmt.Errorf("unsupported state %q (allowed: suspended, asleep)", name)
+			return nil, fmt.Errorf("unsupported state %q (allowed: suspended, asleep, drained)", name)
 		}
 		if _, dup := seen[st]; dup {
 			continue
@@ -1733,6 +1736,14 @@ func parsePruneStates(s string) ([]worker.SessionState, error) {
 		return nil, fmt.Errorf("--state must list at least one state")
 	}
 	return out, nil
+}
+
+func formatPruneStates(states []worker.SessionState) string {
+	names := make([]string, 0, len(states))
+	for _, state := range states {
+		names = append(names, string(state))
+	}
+	return strings.Join(names, ",")
 }
 
 // parsePruneDuration parses a duration string like "7d", "24h", "30m".

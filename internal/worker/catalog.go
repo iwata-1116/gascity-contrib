@@ -67,6 +67,7 @@ type SessionState = sessionpkg.State
 const (
 	SessionStateSuspended = sessionpkg.StateSuspended
 	SessionStateAsleep    = sessionpkg.StateAsleep
+	SessionStateDrained   = sessionpkg.StateDrained
 )
 
 // PruneBefore removes sessions in the given states older than the provided
