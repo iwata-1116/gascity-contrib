@@ -2096,6 +2096,91 @@ func TestPublishManagedCityWaitsForInitialReconcileBeforeRunning(t *testing.T) {
 	})
 }
 
+func TestSupervisorCityStartTimeoutHonorsDaemonStartReadyTimeout(t *testing.T) {
+	cityPath := t.TempDir()
+	if err := os.WriteFile(filepath.Join(cityPath, "city.toml"), []byte(`
+[workspace]
+name = "big-city"
+
+[daemon]
+start_ready_timeout = "9m"
+
+[[agent]]
+name = "mayor"
+`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	oldTimeout := supervisorCityReadyTimeout
+	supervisorCityReadyTimeout = 60 * time.Second
+	t.Cleanup(func() { supervisorCityReadyTimeout = oldTimeout })
+
+	got := supervisorCityStartTimeout(cityPath)
+	if got != 9*time.Minute {
+		t.Errorf("supervisorCityStartTimeout = %v, want 9m (daemon.start_ready_timeout override)", got)
+	}
+}
+
+func TestSupervisorCityStartTimeoutSessionTimeoutCanExtend(t *testing.T) {
+	cityPath := t.TempDir()
+	if err := os.WriteFile(filepath.Join(cityPath, "city.toml"), []byte(`
+[workspace]
+name = "patient-city"
+
+[session]
+startup_timeout = "12m"
+
+[[agent]]
+name = "mayor"
+`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	oldTimeout := supervisorCityReadyTimeout
+	supervisorCityReadyTimeout = 60 * time.Second
+	t.Cleanup(func() { supervisorCityReadyTimeout = oldTimeout })
+
+	got := supervisorCityStartTimeout(cityPath)
+	if got != 12*time.Minute {
+		t.Errorf("supervisorCityStartTimeout = %v, want 12m (session.startup_timeout override)", got)
+	}
+}
+
+func TestSupervisorCityStartTimeoutWithoutExplicitKnobUsesPackageDefault(t *testing.T) {
+	cityPath := t.TempDir()
+	if err := os.WriteFile(filepath.Join(cityPath, "city.toml"), []byte(`
+[workspace]
+name = "default-city"
+
+[session]
+startup_timeout = "1s"
+
+[[agent]]
+name = "mayor"
+`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	oldTimeout := supervisorCityReadyTimeout
+	supervisorCityReadyTimeout = 4 * time.Minute
+	t.Cleanup(func() { supervisorCityReadyTimeout = oldTimeout })
+
+	got := supervisorCityStartTimeout(cityPath)
+	if got != 4*time.Minute {
+		t.Errorf("supervisorCityStartTimeout = %v, want 4m (package default, no daemon override)", got)
+	}
+}
+
+func TestSupervisorCityReadyTimeoutDefaultMatchesConfigDefault(t *testing.T) {
+	// The package-level default must track config.DefaultStartReadyTimeout
+	// so production cities get the configured budget when no explicit
+	// override is set.
+	if supervisorCityReadyTimeout != config.DefaultStartReadyTimeout {
+		t.Errorf("supervisorCityReadyTimeout = %v, want %v (config.DefaultStartReadyTimeout)",
+			supervisorCityReadyTimeout, config.DefaultStartReadyTimeout)
+	}
+}
+
 func TestStartupSessionComputationsDoNotQueryBeadStore(t *testing.T) {
 	logFile := filepath.Join(t.TempDir(), "ops.log")
 	script := writeSpyScript(t, logFile)

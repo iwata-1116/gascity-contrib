@@ -18,7 +18,12 @@ import (
 )
 
 var (
-	supervisorCityReadyTimeout = 180 * time.Second
+	// supervisorCityReadyTimeout bounds how long `gc start` and
+	// `gc register` wait for the supervisor to report a city as Running.
+	// Sized for cities with up to ~40 sessions at the default per-tick
+	// wake budget; cities with more sessions bump it via
+	// [daemon].start_ready_timeout. Tests override this variable directly.
+	supervisorCityReadyTimeout = config.DefaultStartReadyTimeout
 	supervisorCityPollInterval = 100 * time.Millisecond
 )
 
@@ -47,6 +52,19 @@ func supervisorCityStartTimeout(cityPath string) time.Duration {
 	if err != nil {
 		return timeout
 	}
+	// daemon.start_ready_timeout is the canonical operator knob for
+	// extending the ready budget on cities whose session count exceeds
+	// what the package-level default accommodates. Only honor an
+	// explicit value so tests can shrink the timeout via the package
+	// variable without the daemon default silently dominating.
+	if cfg.Daemon.StartReadyTimeout != "" {
+		if ready := cfg.Daemon.StartReadyTimeoutDuration(); ready > timeout {
+			timeout = ready
+		}
+	}
+	// session.startup_timeout escape hatch: a single session that takes
+	// longer than the ready budget extends the wait so the supervisor
+	// has time to surface init failures from that slow session.
 	if startup := cfg.Session.StartupTimeoutDuration(); startup > timeout {
 		timeout = startup
 	}
@@ -401,7 +419,7 @@ func waitForSupervisorCity(cityPath string, wantRunning bool, timeout time.Durat
 		}
 		if time.Now().After(deadline) {
 			if wantRunning {
-				return fmt.Errorf("city did not become ready under supervisor")
+				return fmt.Errorf("city did not become ready under supervisor within %s (set [daemon].start_ready_timeout to a larger duration for cities with many sessions)", timeout)
 			}
 			return fmt.Errorf("city did not stop under supervisor")
 		}
