@@ -24,7 +24,10 @@ var (
 	// wake budget; cities with more sessions bump it via
 	// [daemon].start_ready_timeout. Tests override this variable directly.
 	supervisorCityReadyTimeout = config.DefaultStartReadyTimeout
-	supervisorCityPollInterval = 100 * time.Millisecond
+	// supervisorCityStopTimeoutFloor preserves the historical default
+	// stop/unregister wait floor independently of start-ready sizing.
+	supervisorCityStopTimeoutFloor = 180 * time.Second
+	supervisorCityPollInterval     = 100 * time.Millisecond
 )
 
 // registerCityWithSupervisorTestHook lets tests intercept registration after
@@ -52,15 +55,12 @@ func supervisorCityStartTimeout(cityPath string) time.Duration {
 	if err != nil {
 		return timeout
 	}
-	// daemon.start_ready_timeout is the canonical operator knob for
-	// extending the ready budget on cities whose session count exceeds
-	// what the package-level default accommodates. Only honor an
-	// explicit value so tests can shrink the timeout via the package
-	// variable without the daemon default silently dominating.
+	// daemon.start_ready_timeout is the canonical operator knob for the
+	// start/register ready budget. Only honor an explicit value so tests
+	// can shrink the timeout via the package variable without the daemon
+	// default silently dominating.
 	if cfg.Daemon.StartReadyTimeout != "" {
-		if ready := cfg.Daemon.StartReadyTimeoutDuration(); ready > timeout {
-			timeout = ready
-		}
+		timeout = cfg.Daemon.StartReadyTimeoutDuration()
 	}
 	// session.startup_timeout escape hatch: a single session that takes
 	// longer than the ready budget extends the wait so the supervisor
@@ -72,7 +72,7 @@ func supervisorCityStartTimeout(cityPath string) time.Duration {
 }
 
 func supervisorCityStopTimeout(cityPath string) time.Duration {
-	timeout := supervisorCityReadyTimeout
+	timeout := supervisorCityStopTimeoutFloor
 	cfg, err := loadCityConfig(cityPath, io.Discard)
 	if err != nil {
 		return timeout
@@ -273,7 +273,7 @@ func registerCityWithSupervisorNamed(cityPath, nameOverride string, stdout, stde
 		} else if stdout != nil {
 			fmt.Fprintln(stdout, "Waiting for supervisor to start city...") //nolint:errcheck // best-effort stdout
 		}
-		if err := waitForSupervisorCity(cityPath, true, supervisorCityStartTimeout(cityPath), stdout); err != nil {
+		if err := waitForSupervisorCityHook(cityPath, true, supervisorCityStartTimeout(cityPath), stdout); err != nil {
 			if retried, retriedErr := retrySupervisorCityStartAfterControllerLock(cityPath, stdout, stderr, err); retried {
 				if retriedErr == nil {
 					return 0
@@ -342,7 +342,7 @@ func retrySupervisorCityStartAfterControllerLock(cityPath string, stdout, stderr
 	if reloadSupervisorHook(stdout, stderr) != 0 {
 		return true, fmt.Errorf("%w; reconcile retry failed", startErr)
 	}
-	if err := waitForSupervisorCity(cityPath, true, supervisorCityStartTimeout(cityPath), stdout); err != nil {
+	if err := waitForSupervisorCityHook(cityPath, true, supervisorCityStartTimeout(cityPath), stdout); err != nil {
 		return true, err
 	}
 	return true, nil
@@ -419,7 +419,7 @@ func waitForSupervisorCity(cityPath string, wantRunning bool, timeout time.Durat
 		}
 		if time.Now().After(deadline) {
 			if wantRunning {
-				return fmt.Errorf("city did not become ready under supervisor within %s (set [daemon].start_ready_timeout to a larger duration for cities with many sessions)", timeout)
+				return fmt.Errorf("city did not become ready under supervisor within %s (increase [daemon].start_ready_timeout or [session].startup_timeout for cities with many or slow-starting sessions)", timeout)
 			}
 			return fmt.Errorf("city did not stop under supervisor")
 		}
@@ -526,7 +526,7 @@ func unregisterCityFromSupervisorWithOptions(cityPath string, stdout, stderr io.
 			}
 			return true, 1
 		}
-		if err := waitForSupervisorCity(cityPath, false, supervisorCityReadyTimeout, nil); err != nil {
+		if err := waitForSupervisorCityHook(cityPath, false, supervisorCityStopTimeout(cityPath), nil); err != nil {
 			if reErr := reg.Register(entry.Path, entry.EffectiveName()); reErr != nil {
 				fmt.Fprintf(stderr, "%s: %v; restore failed for '%s': %v\n", commandName, err, entry.EffectiveName(), reErr) //nolint:errcheck
 			} else {
@@ -547,6 +547,8 @@ func unregisterCityFromSupervisorWithOptions(cityPath string, stdout, stderr io.
 }
 
 var waitForSupervisorControllerStopHook = waitForStandaloneControllerStop
+
+var waitForSupervisorCityHook = waitForSupervisorCity
 
 func supervisorAPIBaseURL() (string, error) {
 	cfg, err := supervisor.LoadConfig(supervisor.ConfigPath())

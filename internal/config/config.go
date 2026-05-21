@@ -1786,7 +1786,9 @@ type DaemonConfig struct {
 	// time to wake N sessions is roughly ceil(N / max_wakes_per_tick) *
 	// patrol_interval. At the defaults (5 wakes / 30s), ~40 sessions
 	// need ~4 minutes. Duration string (e.g., "5m", "10m"). Defaults to
-	// DefaultStartReadyTimeout (5m).
+	// DefaultStartReadyTimeout (5m). When set, this value replaces the
+	// default start/register budget; [session].startup_timeout may still
+	// extend the effective wait for a slow single session.
 	StartReadyTimeout string `toml:"start_ready_timeout,omitempty" jsonschema:"default=5m"`
 }
 
