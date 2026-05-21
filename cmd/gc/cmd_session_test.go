@@ -169,6 +169,45 @@ func TestSessionNewJSONRequiresNoAttach(t *testing.T) {
 	}
 }
 
+func TestParsePruneStates(t *testing.T) {
+	tests := []struct {
+		input   string
+		want    []worker.SessionState
+		wantErr bool
+	}{
+		{"suspended", []worker.SessionState{worker.SessionStateSuspended}, false},
+		{"asleep", []worker.SessionState{worker.SessionStateAsleep}, false},
+		{"asleep,suspended", []worker.SessionState{worker.SessionStateAsleep, worker.SessionStateSuspended}, false},
+		{" suspended , asleep ", []worker.SessionState{worker.SessionStateSuspended, worker.SessionStateAsleep}, false},
+		{"ASLEEP", []worker.SessionState{worker.SessionStateAsleep}, false},
+		{"suspended,suspended", []worker.SessionState{worker.SessionStateSuspended}, false},
+		{"", nil, true},
+		{",", nil, true},
+		{"active", nil, true},
+		{"draining", nil, true},
+		{"suspended,bogus", nil, true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.input, func(t *testing.T) {
+			got, err := parsePruneStates(tt.input)
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("parsePruneStates(%q) error = %v, wantErr %v", tt.input, err, tt.wantErr)
+			}
+			if tt.wantErr {
+				return
+			}
+			if len(got) != len(tt.want) {
+				t.Fatalf("parsePruneStates(%q) = %v, want %v", tt.input, got, tt.want)
+			}
+			for i, st := range got {
+				if st != tt.want[i] {
+					t.Errorf("parsePruneStates(%q)[%d] = %q, want %q", tt.input, i, st, tt.want[i])
+				}
+			}
+		})
+	}
+}
+
 func TestResolveWorkDir(t *testing.T) {
 	cityPath := t.TempDir()
 	rigRoot := filepath.Join(t.TempDir(), "my-rig")

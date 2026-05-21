@@ -59,7 +59,19 @@ func (c *SessionCatalog) UpdatePresentation(id string, title, alias *string) err
 	return c.manager.UpdatePresentation(id, title, alias)
 }
 
-// PruneBefore removes sessions older than the provided cutoff and reports the result.
-func (c *SessionCatalog) PruneBefore(before time.Time) (SessionPruneResult, error) {
-	return c.manager.PruneDetailed(before)
+// SessionState aliases session.State so callers can name terminal states
+// without importing the session package directly.
+type SessionState = sessionpkg.State
+
+// Session state constants re-exported for the worker boundary.
+const (
+	SessionStateSuspended = sessionpkg.StateSuspended
+	SessionStateAsleep    = sessionpkg.StateAsleep
+)
+
+// PruneBefore removes sessions in the given states older than the provided
+// cutoff and reports the result. When states is empty it defaults to
+// [SessionStateSuspended].
+func (c *SessionCatalog) PruneBefore(before time.Time, states ...SessionState) (SessionPruneResult, error) {
+	return c.manager.PruneDetailed(before, states...)
 }

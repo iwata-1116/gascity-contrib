@@ -1213,6 +1213,27 @@ func templateOverrideWakeInFlight(metadata map[string]string, state State, now t
 	return now.UTC().Before(started.UTC().Add(templateOverrideWakeInFlightGrace()))
 }
 
+// pruneStateTimestamp returns the timestamp that PruneDetailed compares
+// against its cutoff for a session in the given state. Falls back to the
+// bead's CreatedAt when the state-specific metadata is missing or malformed.
+func pruneStateTimestamp(b beads.Bead, state State) time.Time {
+	var key string
+	switch state {
+	case StateSuspended:
+		key = "suspended_at"
+	case StateAsleep:
+		key = "slept_at"
+	}
+	if key != "" {
+		if raw := b.Metadata[key]; raw != "" {
+			if parsed, err := time.Parse(time.RFC3339, raw); err == nil {
+				return parsed
+			}
+		}
+	}
+	return b.CreatedAt
+}
+
 // Prune closes suspended sessions whose suspension time is before the given
 // cutoff. Active and already-closed sessions are never pruned.
 // Returns the number of sessions pruned.
@@ -1221,9 +1242,19 @@ func (m *Manager) Prune(before time.Time) (int, error) {
 	return result.Count, err
 }
 
-// PruneDetailed closes suspended sessions whose suspension time is before the
-// given cutoff and reports the affected session IDs and queued wait nudges.
-func (m *Manager) PruneDetailed(before time.Time) (PruneResult, error) {
+// PruneDetailed closes terminal-state sessions whose state timestamp is before
+// the given cutoff and reports the affected session IDs and queued wait nudges.
+// When no states are supplied it defaults to [StateSuspended] for backward
+// compatibility. Callers may opt in to asleep cleanup by passing StateAsleep
+// (alone or alongside StateSuspended).
+func (m *Manager) PruneDetailed(before time.Time, states ...State) (PruneResult, error) {
+	if len(states) == 0 {
+		states = []State{StateSuspended}
+	}
+	allowed := make(map[State]struct{}, len(states))
+	for _, s := range states {
+		allowed[s] = struct{}{}
+	}
 	all, err := m.store.List(beads.ListQuery{
 		Label: LabelSession,
 	})
@@ -1239,17 +1270,10 @@ func (m *Manager) PruneDetailed(before time.Time) (PruneResult, error) {
 			continue // already closed
 		}
 		state := State(b.Metadata["state"])
-		if state != StateSuspended {
-			continue // only prune suspended sessions
+		if _, ok := allowed[state]; !ok {
+			continue
 		}
-		// Use suspended_at timestamp if available, fall back to CreatedAt
-		// for beads created before suspended_at was introduced.
-		ts := b.CreatedAt
-		if raw := b.Metadata["suspended_at"]; raw != "" {
-			if parsed, err := time.Parse(time.RFC3339, raw); err == nil {
-				ts = parsed
-			}
-		}
+		ts := pruneStateTimestamp(b, state)
 		if !ts.Before(before) {
 			continue
 		}
