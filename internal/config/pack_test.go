@@ -278,6 +278,78 @@ name = "witness"
 // cfg.Agents when ApplyPatches ran and every form of [[patches.agent]]
 // pointing at a rig pack agent failed with "not found in merged config".
 func TestLoadWithIncludes_PatchTargetsRigPackDerivedAgent(t *testing.T) {
+	for _, tt := range []struct {
+		name  string
+		patch string
+	}{
+		{
+			name: "dir plus binding qualified name",
+			patch: `
+[[patches.agent]]
+dir = "proj"
+name = "gs.refinery"
+suspended = true
+`,
+		},
+		{
+			name: "single qualified name",
+			patch: `
+[[patches.agent]]
+name = "proj/gs.refinery"
+suspended = true
+`,
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			dir := t.TempDir()
+			writeFile(t, dir, "city.toml", `
+[workspace]
+name = "test"
+
+[[rigs]]
+name = "proj"
+path = "/tmp/proj"
+
+[rigs.imports.gs]
+source = "./packs/gastown"
+`+tt.patch)
+			writeFile(t, dir, "packs/gastown/pack.toml", `
+[pack]
+name = "gastown"
+schema = 2
+
+[[agent]]
+name = "refinery"
+scope = "rig"
+`)
+
+			cfg, _, err := LoadWithIncludes(fsys.OSFS{}, filepath.Join(dir, "city.toml"))
+			if err != nil {
+				t.Fatalf("LoadWithIncludes: %v", err)
+			}
+
+			var refinery *Agent
+			for i := range cfg.Agents {
+				if cfg.Agents[i].QualifiedName() == "proj/gs.refinery" {
+					refinery = &cfg.Agents[i]
+					break
+				}
+			}
+			if refinery == nil {
+				names := make([]string, 0, len(cfg.Agents))
+				for _, a := range cfg.Agents {
+					names = append(names, a.QualifiedName())
+				}
+				t.Fatalf("agent proj/gs.refinery not found in merged config; agents: %v", names)
+			}
+			if !refinery.Suspended {
+				t.Errorf("refinery.Suspended = false, want true (patch should have applied)")
+			}
+		})
+	}
+}
+
+func TestLoadWithIncludes_RigPatchOverridesCityPatchForRigPackDerivedAgent(t *testing.T) {
 	dir := t.TempDir()
 	writeFile(t, dir, "city.toml", `
 [workspace]
@@ -290,10 +362,15 @@ path = "/tmp/proj"
 [rigs.imports.gs]
 source = "./packs/gastown"
 
+[[rigs.patches]]
+agent = "refinery"
+suspended = false
+
 [[patches.agent]]
 dir = "proj"
 name = "gs.refinery"
 suspended = true
+nudge = "city patch applied"
 `)
 	writeFile(t, dir, "packs/gastown/pack.toml", `
 [pack]
@@ -318,14 +395,88 @@ scope = "rig"
 		}
 	}
 	if refinery == nil {
-		names := make([]string, 0, len(cfg.Agents))
-		for _, a := range cfg.Agents {
-			names = append(names, a.QualifiedName())
-		}
-		t.Fatalf("agent proj/gs.refinery not found in merged config; agents: %v", names)
+		t.Fatal("agent proj/gs.refinery not found in merged config")
 	}
-	if !refinery.Suspended {
-		t.Errorf("refinery.Suspended = false, want true (patch should have applied)")
+	if refinery.Nudge != "city patch applied" {
+		t.Errorf("refinery.Nudge = %q, want city patch to apply before rig patch", refinery.Nudge)
+	}
+	if refinery.Suspended {
+		t.Errorf("refinery.Suspended = true, want false (rig patch should win after city patch)")
+	}
+}
+
+func TestLoadWithIncludes_ProvenanceUsesDeferredRigPatchFinalIdentity(t *testing.T) {
+	dir := t.TempDir()
+	writeFile(t, dir, "city.toml", `
+[workspace]
+name = "test"
+
+[[rigs]]
+name = "proj"
+path = "/tmp/proj"
+
+[rigs.imports.gs]
+source = "./packs/gastown"
+
+[[rigs.patches]]
+agent = "refinery"
+dir = "ops"
+`)
+	writeFile(t, dir, "packs/gastown/pack.toml", `
+[pack]
+name = "gastown"
+schema = 2
+
+[[agent]]
+name = "refinery"
+scope = "rig"
+`)
+
+	cfg, prov, err := LoadWithIncludes(fsys.OSFS{}, filepath.Join(dir, "city.toml"))
+	if err != nil {
+		t.Fatalf("LoadWithIncludes: %v", err)
+	}
+	if cfg.Agents[0].QualifiedName() != "ops/gs.refinery" {
+		t.Fatalf("agent QualifiedName() = %q, want ops/gs.refinery", cfg.Agents[0].QualifiedName())
+	}
+	if _, ok := prov.Agents["ops/gs.refinery"]; !ok {
+		t.Fatalf("provenance missing final identity ops/gs.refinery; agents: %v", prov.Agents)
+	}
+	if _, ok := prov.Agents["proj/gs.refinery"]; ok {
+		t.Fatalf("provenance retained stale identity proj/gs.refinery; agents: %v", prov.Agents)
+	}
+}
+
+func TestApplyDeferredRigPatchesRejectsShiftedAgentRange(t *testing.T) {
+	suspended := true
+	cfg := &City{
+		Agents: []Agent{
+			{Dir: "proj", BindingName: "gs", Name: "refinery"},
+			{Dir: "proj", BindingName: "gs", Name: "refinery"},
+		},
+	}
+	deferred := []deferredRigPatches{
+		{
+			rigName:            "proj",
+			agentStart:         0,
+			agentEnd:           1,
+			expectedAgentCount: len(cfg.Agents),
+			expectedAgentNames: []string{"proj/gs.refinery"},
+			overrides:          []AgentOverride{{Agent: "refinery", Suspended: &suspended}},
+		},
+	}
+
+	cfg.Agents[0].Dir = "other"
+
+	err := applyDeferredRigPatches(cfg, deferred)
+	if err == nil {
+		t.Fatal("expected shifted deferred range to fail")
+	}
+	if !strings.Contains(err.Error(), "changed before deferred rig patches") {
+		t.Fatalf("error = %q, want changed-range message", err)
+	}
+	if cfg.Agents[0].Suspended {
+		t.Fatal("wrong agent was patched before shifted range was rejected")
 	}
 }
 
@@ -334,8 +485,7 @@ scope = "rig"
 // "not found in merged config" error after the ordering fix. Without
 // this check, the swap could mask typos by silently no-oping if the
 // patch list ever became deferral-friendly. The merged config sees both
-// city-scope and rig-scope pack agents, so the available-agents list in
-// the error includes the rig-pack agent the user probably meant.
+// city-scope and rig-scope pack agents before the error is raised.
 func TestLoadWithIncludes_PatchTargetingMissingRigAgentStillErrors(t *testing.T) {
 	dir := t.TempDir()
 	writeFile(t, dir, "city.toml", `

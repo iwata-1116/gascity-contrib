@@ -98,6 +98,8 @@ type LoadOptions struct {
 	// AllowRootDefaultRigImports permits [defaults.rig.imports] only on the
 	// root pack.toml being loaded. Normal pack imports still reject it.
 	AllowRootDefaultRigImports bool
+	deferRigPatches            bool
+	deferredRigPatches         *[]deferredRigPatches
 }
 
 // LoadWithIncludes loads a city.toml and merges all included fragments.
@@ -502,30 +504,19 @@ func LoadWithIncludesOptions(fs fsys.FS, path string, opts LoadOptions, extraInc
 	}
 
 	// Expand rig packs so the merged agent list (city- and rig-scope) is
-	// complete before patches are applied. Rig pack expansion uses
-	// rig.Overrides and pack-internal patches (which are different from
-	// city-level [[patches]]); none of those depend on city-level patches
-	// having been applied first.
+	// complete before city-level patches are applied. Per-rig patches are
+	// deferred so they still run after city-level [[patches.agent]].
 	rigFormulaDirs := make(map[string][]string)
+	var deferredRigPatches []deferredRigPatches
 	if HasPackRigs(root.Rigs) {
-		if err := expandPacks(root, fs, cityRoot, rigFormulaDirs, opts); err != nil {
+		rigPackOpts := opts
+		rigPackOpts.deferRigPatches = true
+		rigPackOpts.deferredRigPatches = &deferredRigPatches
+		if err := expandPacks(root, fs, cityRoot, rigFormulaDirs, rigPackOpts); err != nil {
 			return nil, nil, fmt.Errorf("expanding packs: %w", err)
 		}
 		if len(root.LoadWarnings) > 0 {
 			prov.Warnings = appendUnique(prov.Warnings, root.LoadWarnings...)
-		}
-		// Track pack-expanded agents in provenance.
-		for _, r := range root.Rigs {
-			topoRefs := r.Includes
-			for _, ref := range topoRefs {
-				topoDir, _ := resolvePackRef(ref, cityRoot, cityRoot)
-				topoPath := filepath.Join(topoDir, packFile)
-				for _, a := range root.Agents {
-					if a.Dir == r.Name {
-						prov.Agents[a.QualifiedName()] = topoPath
-					}
-				}
-			}
 		}
 	}
 
@@ -538,6 +529,14 @@ func LoadWithIncludesOptions(fs fsys.FS, path string, opts LoadOptions, extraInc
 			return nil, nil, fmt.Errorf("applying patches: %w", err)
 		}
 		root.Patches = Patches{} // clear after application
+	}
+	if err := applyDeferredRigPatches(root, deferredRigPatches); err != nil {
+		return nil, nil, fmt.Errorf("applying rig patches: %w", err)
+	}
+	if HasPackRigs(root.Rigs) {
+		// Track pack-expanded agents in provenance after deferred rig patches so
+		// Dir overrides are keyed by the agent's final qualified identity.
+		trackPackExpandedAgents(prov, root.Agents)
 	}
 
 	// Apply [global] sections from packs to agents in scope.
@@ -1406,6 +1405,15 @@ func (p *Provenance) recordSource(path string, data []byte) {
 func trackAgents(prov *Provenance, agents []Agent, source string) {
 	for _, a := range agents {
 		prov.Agents[a.QualifiedName()] = source
+	}
+}
+
+func trackPackExpandedAgents(prov *Provenance, agents []Agent) {
+	for _, a := range agents {
+		if a.SourceDir == "" || (a.source != sourcePack && a.source != sourceAutoImport) {
+			continue
+		}
+		prov.Agents[a.QualifiedName()] = filepath.Join(a.SourceDir, packFile)
 	}
 }
 
