@@ -186,6 +186,18 @@ func TestCmdStopWallClockTimeoutBoundsDirectStop(t *testing.T) {
 	// installed its own override, the global state races. Capture the body's
 	// done channel via stopBodyLifecycleHook and wait for it to close in
 	// teardown so the leaked goroutine cannot outlive this test.
+	//
+	// Also install our own shutdownBeadsProviderForStop override pinned to
+	// this test's cityDir. Registering it before the wait-for-bodyDone cleanup
+	// makes t.Cleanup LIFO order restore this override LAST: during the bodyDone
+	// wait, the leaked body goroutine sees Test A's override (not whichever
+	// sibling test has the global at that instant), and any unexpected cityDir
+	// surfaces as a failure on this test instead of as flake noise on the
+	// sibling that installed an override later.
+	overrideShutdownBeadsProviderForStop(t, func(path string) error {
+		assertSameTestPath(t, path, cityDir)
+		return nil
+	})
 	oldFactory := sessionProviderForStopCity
 	oldHook := stopBodyLifecycleHook
 	var bodyDone <-chan struct{}
