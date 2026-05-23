@@ -637,6 +637,32 @@ func TestPolecatPromptDoneSequenceSignalsRefinery(t *testing.T) {
 	}
 }
 
+// TestPolecatPromptHaltsOnAutoPushFalse asserts the done sequence respects
+// mol-pr-from-issue's auto_push=false halt-at-branch-ready contract. The
+// gate must run BEFORE `git push origin HEAD` so a false signal prevents
+// the push and refinery handoff entirely. Regression for gco-ded / gc-m3j:
+// prompt's done sequence was structurally overriding the formula's
+// auto_push gate (BYPASS rate hit 75%).
+func TestPolecatPromptHaltsOnAutoPushFalse(t *testing.T) {
+	dir := exampleDir()
+	path := filepath.Join(dir, "packs", "gastown", "agents", "polecat", "prompt.template.md")
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("reading polecat prompt: %v", err)
+	}
+	body := string(data)
+
+	assertContainsInOrder(t, body,
+		"## FINAL REMINDER: RUN THE DONE SEQUENCE",
+		`AUTO_PUSH=$(gc bd show <work-bead> --json | jq -r '.[0].metadata.auto_push // empty')`,
+		`if [ "$AUTO_PUSH" = "false" ]; then`,
+		`gc runtime drain-ack`,
+		"exit 0",
+		"fi",
+		"git push origin HEAD",
+	)
+}
+
 func TestRefineryFormulaRespectsExistingPRMetadata(t *testing.T) {
 	dir := exampleDir()
 	path := filepath.Join(dir, "packs", "gastown", "formulas", "mol-refinery-patrol.toml")
