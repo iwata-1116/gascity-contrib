@@ -407,7 +407,7 @@ func newDoltStateCmd(stdout, stderr io.Writer) *cobra.Command {
 		Hidden: true,
 		Args:   cobra.NoArgs,
 		RunE: func(_ *cobra.Command, _ []string) error {
-			report, err := startManagedDoltProcess(cityPath, hostText, portText, userText, logLevel, time.Duration(timeoutMS)*time.Millisecond)
+			report, err := startManagedDoltProcess(cityPath, hostText, portText, userText, logLevel, resolveManagedDoltMemoryLimit(cityPath), time.Duration(timeoutMS)*time.Millisecond)
 			for _, line := range managedDoltStartFields(report) {
 				if _, writeErr := fmt.Fprintln(stdout, line); writeErr != nil {
 					fmt.Fprintf(stderr, "gc dolt-state start-managed: %v\n", writeErr) //nolint:errcheck

@@ -18,7 +18,7 @@ import (
 
 func TestDoltServerEnv_DoesNotInjectGCSchedulerDefault(t *testing.T) {
 	parent := []string{"PATH=/usr/bin", "HOME=/home/test"}
-	out := doltServerEnv(parent)
+	out := doltServerEnv(parent, "")
 
 	for _, kv := range out {
 		if strings.HasPrefix(kv, "DOLT_GC_SCHEDULER=") {
@@ -42,7 +42,7 @@ func TestDoltServerEnv_DoesNotInjectGCSchedulerDefault(t *testing.T) {
 
 func TestDoltServerEnv_RespectsUserOverride(t *testing.T) {
 	parent := []string{"PATH=/usr/bin", "DOLT_GC_SCHEDULER=LOADAVG", "HOME=/home/test"}
-	out := doltServerEnv(parent)
+	out := doltServerEnv(parent, "")
 
 	// User-provided value must be preserved exactly.
 	count := 0
@@ -61,9 +61,53 @@ func TestDoltServerEnv_RespectsUserOverride(t *testing.T) {
 
 func TestDoltServerEnv_PreservesEmptyUserValue(t *testing.T) {
 	parent := []string{"DOLT_GC_SCHEDULER="}
-	out := doltServerEnv(parent)
+	out := doltServerEnv(parent, "")
 	if len(out) != 1 || out[0] != "DOLT_GC_SCHEDULER=" {
 		t.Fatalf("explicit empty-value env not preserved: %v", out)
+	}
+}
+
+func countGoMemLimit(env []string) (int, string) {
+	count := 0
+	value := ""
+	for _, kv := range env {
+		if strings.HasPrefix(kv, "GOMEMLIMIT=") {
+			count++
+			value = strings.TrimPrefix(kv, "GOMEMLIMIT=")
+		}
+	}
+	return count, value
+}
+
+func TestDoltServerEnv_EmptyLimitInjectsNothing(t *testing.T) {
+	parent := []string{"PATH=/usr/bin", "HOME=/home/test"}
+	out := doltServerEnv(parent, "")
+	if count, _ := countGoMemLimit(out); count != 0 {
+		t.Fatalf("empty memLimit must not inject GOMEMLIMIT, got %v", out)
+	}
+}
+
+func TestDoltServerEnv_NonEmptyLimitInjectsOnce(t *testing.T) {
+	parent := []string{"PATH=/usr/bin", "HOME=/home/test"}
+	out := doltServerEnv(parent, "6000MiB")
+	count, value := countGoMemLimit(out)
+	if count != 1 {
+		t.Fatalf("expected exactly one GOMEMLIMIT entry, got %d in %v", count, out)
+	}
+	if value != "6000MiB" {
+		t.Fatalf("GOMEMLIMIT = %q, want %q", value, "6000MiB")
+	}
+}
+
+func TestDoltServerEnv_OperatorOverrideWins(t *testing.T) {
+	parent := []string{"PATH=/usr/bin", "GOMEMLIMIT=4GiB", "HOME=/home/test"}
+	out := doltServerEnv(parent, "6000MiB")
+	count, value := countGoMemLimit(out)
+	if count != 1 {
+		t.Fatalf("operator's GOMEMLIMIT must be preserved as the only entry, got %d in %v", count, out)
+	}
+	if value != "4GiB" {
+		t.Fatalf("operator override clobbered: GOMEMLIMIT = %q, want %q", value, "4GiB")
 	}
 }
 
@@ -530,7 +574,7 @@ func TestManagedDoltWatchdogExternalParentHelper(t *testing.T) {
 	}
 	defer logFile.Close() //nolint:errcheck
 
-	started, err := startManagedDoltSQLServerWithTestWatchdog("", configPath, logPath, logFile)
+	started, err := startManagedDoltSQLServerWithTestWatchdog("", configPath, logPath, logFile, "")
 	if err != nil {
 		t.Fatalf("start managed dolt with watchdog: %v", err)
 	}

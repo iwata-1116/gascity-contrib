@@ -1747,6 +1747,15 @@ type DaemonConfig struct {
 	// that budget can be cut short on that path even though the direct
 	// stop/unregister path always honors the full grace.
 	DoltStopTimeout string `toml:"dolt_stop_timeout,omitempty" jsonschema:"default=30s"`
+	// DoltMemoryLimit bounds the managed dolt sql-server's Go heap by setting
+	// GOMEMLIMIT on the dolt process. Free-form string passed verbatim to
+	// GOMEMLIMIT (e.g. "6000MiB", "4GiB", or a raw byte count). Empty (the
+	// default) injects nothing, preserving today's unbounded behavior. Opt in
+	// to stop dolt's anonymous-memory growth from exhausting host RAM —
+	// especially under WSL2, where the vmmem RAM cap plus swap.vhdx thrash
+	// freeze the host with no OOM-kill. An explicit GOMEMLIMIT already in the
+	// dolt process environment wins over this value.
+	DoltMemoryLimit string `toml:"dolt_memory_limit,omitempty"`
 	// WispGCInterval is how often wisp GC runs. Duration string (e.g., "5m", "1h").
 	// Wisp GC is disabled unless both WispGCInterval and WispTTL are set.
 	WispGCInterval string `toml:"wisp_gc_interval,omitempty"`

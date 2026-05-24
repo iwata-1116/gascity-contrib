@@ -45,6 +45,26 @@ func resolveManagedDoltStopTimeout(cityPath string) time.Duration {
 	return cfg.Daemon.DoltStopTimeoutDuration()
 }
 
+// resolveManagedDoltMemoryLimit returns the operator-configured GOMEMLIMIT for
+// the managed dolt sql-server, read from `[daemon].dolt_memory_limit` in
+// city.toml. Empty (the default, or any load failure) means inject nothing,
+// preserving dolt's historical unbounded heap behavior.
+//
+// An empty cityPath returns "" without attempting a config load, for the same
+// reason as resolveManagedDoltStopTimeout: loadCityConfig("", …) would resolve
+// "city.toml" relative to the current working directory and read a stray
+// config. Recovery/startup-cleanup callers may pass an empty cityPath.
+func resolveManagedDoltMemoryLimit(cityPath string) string {
+	if strings.TrimSpace(cityPath) == "" {
+		return ""
+	}
+	cfg, err := loadCityConfig(cityPath, io.Discard)
+	if err != nil || cfg == nil {
+		return ""
+	}
+	return strings.TrimSpace(cfg.Daemon.DoltMemoryLimit)
+}
+
 // managedDoltStopPollInterval returns the liveness-poll interval for the
 // SIGTERM wait loop. It is normally 500ms, but is shrunk to the grace period
 // itself when the configured grace is shorter than one poll — otherwise a

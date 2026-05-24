@@ -97,11 +97,11 @@ func init() {
 	os.Exit(runManagedDoltTestWatchdog(os.Args[2:], os.Stdout, os.Stderr))
 }
 
-func startManagedDoltProcess(cityPath, host, port, user, logLevel string, timeout time.Duration) (managedDoltStartReport, error) {
-	return startManagedDoltProcessWithOptions(cityPath, host, port, user, logLevel, -1, timeout, true)
+func startManagedDoltProcess(cityPath, host, port, user, logLevel, memLimit string, timeout time.Duration) (managedDoltStartReport, error) {
+	return startManagedDoltProcessWithOptions(cityPath, host, port, user, logLevel, memLimit, -1, timeout, true)
 }
 
-func startManagedDoltProcessWithOptions(cityPath, host, port, user, logLevel string, archiveLevel int, timeout time.Duration, publish bool) (managedDoltStartReport, error) {
+func startManagedDoltProcessWithOptions(cityPath, host, port, user, logLevel, memLimit string, archiveLevel int, timeout time.Duration, publish bool) (managedDoltStartReport, error) {
 	layout, err := resolveManagedDoltRuntimeLayout(cityPath)
 	if err != nil {
 		return managedDoltStartReport{}, err
@@ -147,7 +147,7 @@ func startManagedDoltProcessWithOptions(cityPath, host, port, user, logLevel str
 			return report, fmt.Errorf("open log file: %w", err)
 		}
 
-		started, err := startManagedDoltSQLServer(cityPath, layout.ConfigFile, layout.LogFile, logFile)
+		started, err := startManagedDoltSQLServer(cityPath, layout.ConfigFile, layout.LogFile, logFile, memLimit)
 		if err != nil {
 			_ = logFile.Close()
 			return report, err
@@ -226,23 +226,23 @@ func startManagedDoltProcessWithOptions(cityPath, host, port, user, logLevel str
 	return report, fmt.Errorf("dolt server could not find a free port after repeated address-in-use failures (last port %d)", report.Port)
 }
 
-func startManagedDoltSQLServer(cityPath, configFile, logFilePath string, logFile *os.File) (managedDoltStartedProcess, error) {
+func startManagedDoltSQLServer(cityPath, configFile, logFilePath string, logFile *os.File, memLimit string) (managedDoltStartedProcess, error) {
 	if managedDoltTestWatchdogEnabled() {
-		return startManagedDoltSQLServerWithTestWatchdog(cityPath, configFile, logFilePath, logFile)
+		return startManagedDoltSQLServerWithTestWatchdog(cityPath, configFile, logFilePath, logFile, memLimit)
 	}
 	cmd := exec.Command("dolt", "sql-server", "--config", configFile)
 	cmd.Stdout = logFile
 	cmd.Stderr = logFile
 	cmd.Stdin = nil
 	cmd.SysProcAttr = managedDoltSQLServerSysProcAttr()
-	cmd.Env = doltServerEnv(os.Environ())
+	cmd.Env = doltServerEnv(os.Environ(), memLimit)
 	if err := cmd.Start(); err != nil {
 		return managedDoltStartedProcess{}, fmt.Errorf("start dolt sql-server: %w", err)
 	}
 	return managedDoltStartedProcess{CityPath: cityPath, PID: cmd.Process.Pid}, nil
 }
 
-func startManagedDoltSQLServerWithTestWatchdog(cityPath, configFile, logFilePath string, logFile *os.File) (managedDoltStartedProcess, error) {
+func startManagedDoltSQLServerWithTestWatchdog(cityPath, configFile, logFilePath string, logFile *os.File, memLimit string) (managedDoltStartedProcess, error) {
 	disarmFile, err := managedDoltTestWatchdogDisarmFile(logFilePath)
 	if err != nil {
 		return managedDoltStartedProcess{}, err
@@ -266,7 +266,7 @@ func startManagedDoltSQLServerWithTestWatchdog(cityPath, configFile, logFilePath
 	cmd := exec.Command(watchdogExecutable, args...)
 	cmd.Stderr = logFile
 	cmd.Stdin = nil
-	cmd.Env = doltServerEnv(os.Environ())
+	cmd.Env = doltServerEnv(os.Environ(), memLimit)
 	if parentPipeRead != nil {
 		cmd.ExtraFiles = []*os.File{parentPipeRead}
 	}
@@ -691,7 +691,10 @@ func runManagedDoltTestWatchdog(args []string, stdout, stderr *os.File) int {
 	// archive workers) outlive their parent and leak across test runs
 	// (gastownhall/gascity#2313 follow-up M3).
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-	cmd.Env = doltServerEnv(os.Environ())
+	// This re-exec'd test watchdog already inherited any GOMEMLIMIT the spawner
+	// injected at startManagedDoltSQLServerWithTestWatchdog, so pass "" and let
+	// the inherited value flow through unchanged.
+	cmd.Env = doltServerEnv(os.Environ(), "")
 	if err := cmd.Start(); err != nil {
 		fmt.Fprintf(stderr, "start dolt sql-server: %v\n", err) //nolint:errcheck
 		return 1
@@ -760,7 +763,22 @@ func managedDoltTestParentDone(rawFD string) (<-chan struct{}, func(), error) {
 }
 
 // doltServerEnv returns the environment applied to every managed dolt
-// sql-server we launch.
-func doltServerEnv(parent []string) []string {
-	return append([]string(nil), parent...)
+// sql-server we launch. When memLimit is non-empty and the parent env does not
+// already set GOMEMLIMIT, it appends "GOMEMLIMIT=<memLimit>". When memLimit is
+// empty it returns the parent unchanged (the historical behavior).
+func doltServerEnv(parent []string, memLimit string) []string {
+	env := append([]string(nil), parent...)
+	if strings.TrimSpace(memLimit) == "" {
+		return env
+	}
+	for _, kv := range env {
+		if strings.HasPrefix(kv, "GOMEMLIMIT=") {
+			// An operator's explicit GOMEMLIMIT wins; never override it.
+			return env
+		}
+	}
+	// Bound dolt's Go heap so its anonymous-memory growth can't exhaust host
+	// RAM — critical under WSL2, where the vmmem RAM cap + swap.vhdx thrash
+	// freeze the host with no OOM-kill.
+	return append(env, "GOMEMLIMIT="+memLimit)
 }
