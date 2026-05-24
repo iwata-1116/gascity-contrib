@@ -535,6 +535,46 @@ case "$query" in
         exit 49
       fi
     fi
+    # writer_race_before_flatten: a normal MVCC writer commits inside the
+    # residual window between the final stable pre-flight HEAD check and the
+    # flatten's DOLT_RESET. The pre-flight loop stabilizes at headcommit, so the
+    # pre-reset HEAD probe (the 3rd HEAD probe taken while still at headcommit)
+    # reports writercommit. State stays at headcommit so the flatten still
+    # advances HEAD to compactcommit and verify still observes the gain+drift.
+    # This advance lives in the HEAD-probe arm (not current_head) so the
+    # "$(current_head)" gate-checks in other arms keep seeing the real state.
+    if [ "$mode" = "writer_race_before_flatten" ] && [ "$(current_head)" = "headcommit" ]; then
+      calls_file="$state_file.prereset-head-calls"
+      calls=0
+      if [ -f "$calls_file" ]; then
+        calls="$(cat "$calls_file")"
+      fi
+      calls=$((calls + 1))
+      printf '%%s\n' "$calls" > "$calls_file"
+      if [ "$calls" -ge 3 ]; then
+        print_cell writercommit
+        exit 0
+      fi
+    fi
+    # writer_race_during_verify: a writer commits during/after the post-flatten
+    # verify. The flatten advances HEAD to compactcommit; the 1st HEAD probe at
+    # compactcommit is the flatten_head probe and the 2nd is the post-verify
+    # probe, which reports writercommit so HEAD has moved past the flatten's own
+    # commit. verify_counts still sees compactcommit (gain+drift) because it does
+    # not probe HEAD and the "$(current_head)" gates read the real state.
+    if { [ "$mode" = "writer_race_during_verify" ] || [ "$mode" = "writer_race_db_hash_during_verify" ]; } && [ "$(current_head)" = "compactcommit" ]; then
+      calls_file="$state_file.postverify-head-calls"
+      calls=0
+      if [ -f "$calls_file" ]; then
+        calls="$(cat "$calls_file")"
+      fi
+      calls=$((calls + 1))
+      printf '%%s\n' "$calls" > "$calls_file"
+      if [ "$calls" -ge 2 ]; then
+        print_cell writercommit
+        exit 0
+      fi
+    fi
     print_cell "$(current_head)"
     exit 0
     ;;
@@ -574,7 +614,7 @@ case "$query" in
       print_cell ""
       exit 0
     fi
-    if { [ "$mode" = "row_count_and_hash_diverges" ] || [ "$mode" = "same_table_replacement_with_row_gain" ] || [ "$mode" = "mixed_row_count_gain_and_same_count_hash_drift" ]; } && [ "$(current_head)" = "compactcommit" ]; then
+    if { [ "$mode" = "row_count_and_hash_diverges" ] || [ "$mode" = "same_table_replacement_with_row_gain" ] || [ "$mode" = "mixed_row_count_gain_and_same_count_hash_drift" ] || [ "$mode" = "writer_race_before_flatten" ] || [ "$mode" = "writer_race_during_verify" ]; } && [ "$(current_head)" = "compactcommit" ]; then
       print_cell hash-beads-after-writer
       exit 0
     fi
@@ -666,7 +706,7 @@ case "$query" in
       printf 'row count exploded after flatten\n' >&2
       exit 47
     fi
-    if { [ "$mode" = "row_count_gain_with_stable_hashes" ] || [ "$mode" = "row_count_gain_with_db_hash_drift" ] || [ "$mode" = "row_count_and_hash_diverges" ] || [ "$mode" = "same_table_replacement_with_row_gain" ] || [ "$mode" = "mixed_row_count_gain_and_same_count_hash_drift" ]; } && [ "$calls" -gt 1 ]; then
+    if { [ "$mode" = "row_count_gain_with_stable_hashes" ] || [ "$mode" = "row_count_gain_with_db_hash_drift" ] || [ "$mode" = "row_count_and_hash_diverges" ] || [ "$mode" = "same_table_replacement_with_row_gain" ] || [ "$mode" = "mixed_row_count_gain_and_same_count_hash_drift" ] || [ "$mode" = "writer_race_before_flatten" ] || [ "$mode" = "writer_race_during_verify" ] || [ "$mode" = "writer_race_db_hash_during_verify" ]; } && [ "$calls" -gt 1 ]; then
       print_cell 11
     elif [ "$mode" = "row_count_decreases" ] && [ "$calls" -gt 1 ]; then
       print_cell 9
@@ -698,7 +738,7 @@ case "$query" in
     if [ "$mode" = "same_row_count_writer" ]; then
       set_hash hash-after-writer
     fi
-    if [ "$mode" = "row_count_gain_with_db_hash_drift" ] || [ "$mode" = "same_count_db_hash_drift" ] || [ "$mode" = "row_count_and_hash_diverges" ] || [ "$mode" = "same_table_replacement_with_row_gain" ]; then
+    if [ "$mode" = "row_count_gain_with_db_hash_drift" ] || [ "$mode" = "same_count_db_hash_drift" ] || [ "$mode" = "row_count_and_hash_diverges" ] || [ "$mode" = "same_table_replacement_with_row_gain" ] || [ "$mode" = "writer_race_db_hash_during_verify" ]; then
       set_hash hash-after-writer
     fi
     exit 0
@@ -1792,6 +1832,111 @@ func TestCompactScriptQuarantinesMixedRowGainAndSameCountHashDriftBeforeFullGC(t
 	marker := filepath.Join(fixture.cityPath, ".gc", "runtime", "packs", "dolt", "compact-quarantine", "beads")
 	if reason := compactMarkerValue(t, marker, "reason"); reason != "post-flatten table value hash changed with row-count increase" {
 		t.Fatalf("quarantine reason should identify first table hash drift, got %q", reason)
+	}
+}
+
+// assertCompactWriterRaceDeferred encodes the shared expectations for a proven
+// writer-race defer: the gain+drift quarantine is downgraded to a skip, so the
+// run exits 0, logs the defer message, writes NO quarantine marker, and does not
+// run DOLT_GC (GC is left for the next run after the writer settles).
+func assertCompactWriterRaceDeferred(t *testing.T, fixture compactScriptFixture, out string, err error) {
+	t.Helper()
+	if err != nil {
+		t.Fatalf("writer-race defer must exit 0 (skip, not failure): %v\n%s", err, out)
+	}
+	if !strings.Contains(out, "writer race detected during flatten") ||
+		!strings.Contains(out, "deferring, will retry next run") {
+		t.Fatalf("output missing writer-race defer message:\n%s", out)
+	}
+	quarantine := filepath.Join(fixture.cityPath, ".gc", "runtime", "packs", "dolt", "compact-quarantine", "beads")
+	if _, statErr := os.Stat(quarantine); !os.IsNotExist(statErr) {
+		t.Fatalf("writer-race defer must NOT write a quarantine marker; stat=%v", statErr)
+	}
+	data, readErr := os.ReadFile(fixture.doltLog)
+	if readErr != nil {
+		t.Fatalf("read dolt log: %v", readErr)
+	}
+	if strings.Contains(string(data), "DOLT_GC") {
+		t.Fatalf("writer-race defer must skip GC this run:\n%s", string(data))
+	}
+}
+
+// A normal MVCC writer that commits in the residual window between the final
+// stable pre-flight HEAD check and the flatten's reset produces a post-flatten
+// row-count gain + table value-hash drift that is indistinguishable, by value
+// alone, from corruption. Because HEAD captured immediately before the reset
+// differs from the stable pre-flight HEAD, the writer is proven and the run
+// defers instead of writing the blocking quarantine marker.
+func TestCompactScriptDefersWhenWriterCommitsBeforeFlatten(t *testing.T) {
+	fixture := newCompactScriptFixture(t)
+	out, err := fixture.run(t, "writer_race_before_flatten", "GC_DOLT_COMPACT_THRESHOLD_COMMITS=500")
+	if !strings.Contains(out, "table=beads gained rows during flatten") ||
+		!strings.Contains(out, "value hash changed with row-count increase") {
+		t.Fatalf("output missing the ambiguous gain+drift signal that the gate downgrades:\n%s", out)
+	}
+	if !strings.Contains(out, "pre_reset_HEAD=writercommit") {
+		t.Fatalf("defer message should report the pre-reset writer HEAD:\n%s", out)
+	}
+	assertCompactWriterRaceDeferred(t, fixture, out, err)
+}
+
+// A writer that commits during/after the post-flatten verify moves HEAD past
+// the flatten's own commit. That difference proves a concurrent writer and the
+// gain+drift quarantine is downgraded to a defer.
+func TestCompactScriptDefersWhenWriterCommitsDuringVerify(t *testing.T) {
+	fixture := newCompactScriptFixture(t)
+	out, err := fixture.run(t, "writer_race_during_verify", "GC_DOLT_COMPACT_THRESHOLD_COMMITS=500")
+	if !strings.Contains(out, "table=beads gained rows during flatten") ||
+		!strings.Contains(out, "value hash changed with row-count increase") {
+		t.Fatalf("output missing the ambiguous gain+drift signal that the gate downgrades:\n%s", out)
+	}
+	if !strings.Contains(out, "post_verify_HEAD=writercommit") {
+		t.Fatalf("defer message should report HEAD moving past the flatten commit:\n%s", out)
+	}
+	assertCompactWriterRaceDeferred(t, fixture, out, err)
+}
+
+// The whole-database value hash also drifts when a concurrent writer adds rows.
+// When per-table checks pass but the database hash drifts with a row gain and a
+// writer is proven (HEAD moved past the flatten commit), the database-hash
+// gain+drift quarantine is likewise downgraded to a defer.
+func TestCompactScriptDefersWhenWriterCommitsCausingDatabaseHashDrift(t *testing.T) {
+	fixture := newCompactScriptFixture(t)
+	out, err := fixture.run(t, "writer_race_db_hash_during_verify", "GC_DOLT_COMPACT_THRESHOLD_COMMITS=500")
+	if !strings.Contains(out, "database value hash drift with row-count increase") {
+		t.Fatalf("output missing the database-hash writer-race defer:\n%s", out)
+	}
+	if !strings.Contains(out, "post_verify_HEAD=writercommit") {
+		t.Fatalf("defer message should report HEAD moving past the flatten commit:\n%s", out)
+	}
+	assertCompactWriterRaceDeferred(t, fixture, out, err)
+}
+
+// Control: the same gain+drift signal with a STABLE HEAD (no writer proven) is a
+// genuine anomaly and must still write the blocking quarantine marker and fail.
+// This guards against the writer-race gate weakening real-corruption detection.
+func TestCompactScriptStillQuarantinesGainAndHashDriftWithStableHead(t *testing.T) {
+	fixture := newCompactScriptFixture(t)
+	out, err := fixture.run(t, "same_table_replacement_with_row_gain", "GC_DOLT_COMPACT_THRESHOLD_COMMITS=500")
+	if err == nil {
+		t.Fatalf("stable-HEAD gain+drift must remain a blocking failure:\n%s", out)
+	}
+	if strings.Contains(out, "writer race detected") {
+		t.Fatalf("stable HEAD must not be misclassified as a writer race:\n%s", out)
+	}
+	if !strings.Contains(out, "post-flatten INTEGRITY check failed") {
+		t.Fatalf("stable-HEAD gain+drift should escalate as an integrity failure:\n%s", out)
+	}
+	marker := filepath.Join(fixture.cityPath, ".gc", "runtime", "packs", "dolt", "compact-quarantine", "beads")
+	if reason := compactMarkerValue(t, marker, "reason"); reason != "post-flatten table value hash changed with row-count increase" {
+		t.Fatalf("stable-HEAD gain+drift must quarantine with the gain+drift reason, got %q", reason)
+	}
+	data, readErr := os.ReadFile(fixture.doltLog)
+	if readErr != nil {
+		t.Fatalf("read dolt log: %v", readErr)
+	}
+	if strings.Contains(string(data), "DOLT_GC") {
+		t.Fatalf("stable-HEAD gain+drift must block full GC:\n%s", string(data))
 	}
 }
 

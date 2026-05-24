@@ -24,6 +24,23 @@
 #      continue only when table and database value hashes stay stable. Any
 #      value-hash drift, table-list drift, or row-count decrease is
 #      quarantined before full GC.
+#   4a. Local-verify HEAD-stability gate. The pre-flight stability loop cannot
+#      close the residual window between its final HEAD check and the flatten,
+#      nor the window during post-flatten verify, so a normal MVCC writer (the
+#      beads/mail workload) can still commit inside the flatten window. That
+#      legitimately adds rows and shifts value hashes versus the snapshot, which
+#      otherwise looks identical to the ambiguous gain+drift corruption signal.
+#      Quarantining that false positive blocks all future GC of the db and
+#      starves DOLT_GC until host memory is exhausted. So, mirroring the remote-
+#      push path's HEAD-stability defer, the gain+drift case is downgraded from
+#      a blocking quarantine to a skip-and-retry-next-run ONLY when a concurrent
+#      writer is proven. A writer is proven (and distinguished from the flatten's
+#      OWN commit) when either HEAD captured immediately before the mutating
+#      reset differs from the stable pre-flight HEAD (a writer landed in the
+#      preflight->reset window, before the flatten committed), or HEAD captured
+#      after verify moved past the flatten's own commit (a writer landed during/
+#      after verify). All other failures — and gain+drift with a stable HEAD —
+#      still quarantine. Probe failure leaves the race unproven and quarantines.
 #   5. Run CALL DOLT_GC('--full') to reclaim chunks orphaned by the flatten.
 #
 # Remote push failures are recorded in compact-pending-push markers and do not
@@ -1230,6 +1247,9 @@ flatten_database() {
   verify_counts_saw_gain=0
   verify_counts_failure_reason=""
   verify_counts_failure_guidance=""
+  head_before_reset=""
+  post_verify_head=""
+  writer_race_detected=0
 
   if [ -n "$only_dbs" ]; then
     case ",$only_dbs," in
@@ -1574,6 +1594,16 @@ flatten_database() {
 
   start=$(date +%s)
 
+  # Capture HEAD one last time immediately before the mutating flatten. The
+  # preflight loop already proved HEAD == "$head" stayed stable across the
+  # snapshot gather, so this probe runs strictly BEFORE the flatten's own
+  # DOLT_RESET/DOLT_COMMIT — any difference from "$head" here can only be an
+  # external writer that committed inside the residual preflight->reset window,
+  # never the flatten's own commit (which has not happened yet). An empty/failed
+  # probe leaves head_before_reset empty, which the writer-race gate treats as
+  # "unproven" and therefore falls back to the safe quarantine behavior.
+  head_before_reset=$(head_commit "$db" || true)
+
   # Soft-reset to root + commit-everything is the flatten transaction.
   # Both run in a single dolt sql invocation so the session keeps the
   # USE selection across the two CALLs.
@@ -1609,9 +1639,51 @@ flatten_database() {
 
   verify_counts_rc=0
   verify_counts "$db" "$preflight_tmp" || verify_counts_rc=$?
+
+  # Writer-race gate (local-verify HEAD-stability). A normal MVCC writer (the
+  # beads/mail workload) can commit to this db inside the flatten window, which
+  # legitimately adds rows and changes value hashes versus the pre-flight
+  # snapshot. That is a benign, self-healing condition — the next scheduled run
+  # retries — and must NOT be quarantined (a quarantine marker blocks all future
+  # GC of the db and is the production memory-exhaustion bug).
+  #
+  # We distinguish a writer commit from the flatten's OWN commit using two
+  # independent signals, both anchored so the flatten's own commit never trips
+  # them:
+  #   * head_before_reset != head  — HEAD moved between the stable pre-flight
+  #     snapshot and the pre-reset probe. That probe runs before the flatten
+  #     mutates anything, so only an external writer can have moved HEAD.
+  #   * post_verify_head != flatten_head — HEAD moved past the flatten's own
+  #     commit during/after verify_counts. The script issues no commit between
+  #     the flatten and this probe, so only an external writer can have moved it.
+  # Either signal proves a concurrent writer. If a HEAD probe fails/returns
+  # empty we leave the corresponding value empty and the equality below cannot
+  # become true, so an unprovable race safely falls through to quarantine.
+  post_verify_head=$(head_commit "$db" || true)
+  writer_race_detected=0
+  if [ -n "$head" ] && [ -n "$head_before_reset" ] && [ "$head_before_reset" != "$head" ]; then
+    writer_race_detected=1
+  fi
+  if [ -n "$flatten_head" ] && [ -n "$post_verify_head" ] && [ "$post_verify_head" != "$flatten_head" ]; then
+    writer_race_detected=1
+  fi
+
   if [ "$verify_counts_rc" -ne 0 ]; then
     integrity_reason="${verify_counts_failure_reason:-post-flatten integrity check failed}"
     integrity_guidance="${verify_counts_failure_guidance:-post-flatten integrity check failed; investigate before re-running}"
+    # Downgrade quarantine -> defer ONLY for the ambiguous gain+drift case when
+    # a concurrent writer is proven. Every other integrity failure (row-count
+    # decrease, same-count hash drift, table-list drift, probe failure) and the
+    # gain+drift case with a stable HEAD still quarantine below unchanged.
+    if [ "$writer_race_detected" = "1" ] && \
+       [ "${verify_counts_saw_gain:-0}" = "1" ] && \
+       [ "$verify_counts_failure_reason" = "post-flatten table value hash changed with row-count increase" ]; then
+      printf 'compact: db=%s writer race detected during flatten (snapshot_HEAD=%s pre_reset_HEAD=%s flatten_HEAD=%s post_verify_HEAD=%s) — table value hash drift with row-count increase is concurrent-writer data, not corruption; deferring, will retry next run\n' \
+        "$db" "$head" "${head_before_reset:-<empty>}" "$flatten_head" "${post_verify_head:-<empty>}" >&2
+      preserve_head_after_integrity_failure "$db" "$flatten_head" || true
+      rm -f "$preflight_tmp"
+      return 0
+    fi
     printf 'compact: db=%s post-flatten INTEGRITY check failed — escalate (%s)\n' \
       "$db" "$integrity_guidance" >&2
     write_compact_marker "$quarantine_dir" "$db" "$integrity_reason" || {
@@ -1649,6 +1721,17 @@ flatten_database() {
   fi
   if [ "$postflight_hash" != "$preflight_hash" ]; then
     if [ "${verify_counts_saw_gain:-0}" = "1" ]; then
+      # Same writer-race downgrade as the per-table gain+drift case above: a
+      # proven concurrent writer that added rows also shifts the whole-database
+      # value hash. Defer instead of quarantining. A stable-HEAD gain+drift here
+      # is still a genuine anomaly and quarantines unchanged.
+      if [ "$writer_race_detected" = "1" ]; then
+        printf 'compact: db=%s writer race detected during flatten (snapshot_HEAD=%s pre_reset_HEAD=%s flatten_HEAD=%s post_verify_HEAD=%s) — database value hash drift with row-count increase is concurrent-writer data, not corruption; deferring, will retry next run\n' \
+          "$db" "$head" "${head_before_reset:-<empty>}" "$flatten_head" "${post_verify_head:-<empty>}" >&2
+        preserve_head_after_integrity_failure "$db" "$flatten_head" || true
+        rm -f "$preflight_tmp"
+        return 0
+      fi
       printf 'compact: db=%s value hash changed with row-count increase before=%s after=%s — quarantine and investigate before GC\n' \
         "$db" "$preflight_hash" "$postflight_hash" >&2
       write_compact_marker "$quarantine_dir" "$db" "post-flatten value hash changed with row-count increase" || {
