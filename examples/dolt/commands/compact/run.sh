@@ -697,13 +697,18 @@ preflight_counts() {
 # Row-count decreases fail. Row-count increases are recorded as concurrent
 # writer evidence only when the table value hash stays stable. Any table hash
 # drift is quarantined before full GC because row-count gain alone cannot prove
-# pre-flight rows remain reachable. Sets verify_counts_saw_gain,
-# verify_counts_failure_reason, and verify_counts_failure_guidance for callers.
+# pre-flight rows remain reachable. Sets category flags plus
+# verify_counts_failure_reason and verify_counts_failure_guidance for callers.
 verify_counts() {
   db="$1"
   preflight="$2"
   fail=0
   verify_counts_saw_gain=0
+  verify_counts_saw_gain_hash_drift=0
+  verify_counts_saw_row_decrease=0
+  verify_counts_saw_same_count_hash_drift=0
+  verify_counts_saw_table_list_change=0
+  verify_counts_saw_probe_failure=0
   verify_counts_failure_reason=""
   verify_counts_failure_guidance=""
   preflight_tables=""
@@ -716,6 +721,7 @@ verify_counts() {
     expected_hash=${rest#* }
     if ! actual=$(row_count "$db" "$t"); then
       printf 'compact: db=%s post-flatten row count failed for table=%s\n' "$db" "$t" >&2
+      verify_counts_saw_probe_failure=1
       if [ "$fail" -eq 0 ]; then
         fail=2
         verify_counts_failure_reason="post-flatten row count probe failed"
@@ -726,6 +732,7 @@ verify_counts() {
     case "$actual" in
       ''|*[!0-9]*)
         printf 'compact: db=%s post-flatten row count failed for table=%s\n' "$db" "$t" >&2
+        verify_counts_saw_probe_failure=1
         if [ "$fail" -eq 0 ]; then
           fail=2
           verify_counts_failure_reason="post-flatten row count probe failed"
@@ -736,6 +743,7 @@ verify_counts() {
     esac
     if ! actual_hash=$(table_value_hash "$db" "$t"); then
       printf 'compact: db=%s post-flatten table value hash failed for table=%s\n' "$db" "$t" >&2
+      verify_counts_saw_probe_failure=1
       if [ "$fail" -eq 0 ]; then
         fail=2
         verify_counts_failure_reason="post-flatten table value hash probe failed"
@@ -745,6 +753,7 @@ verify_counts() {
     fi
     if [ -z "$actual_hash" ]; then
       printf 'compact: db=%s post-flatten table value hash returned empty value for table=%s\n' "$db" "$t" >&2
+      verify_counts_saw_probe_failure=1
       if [ "$fail" -eq 0 ]; then
         fail=2
         verify_counts_failure_reason="post-flatten table value hash probe failed"
@@ -757,6 +766,7 @@ verify_counts() {
       if [ "$actual" -lt "$expected" ]; then
         printf 'compact: db=%s row count decreased after flatten table=%s before=%s after=%s\n' \
           "$db" "$t" "$expected" "$actual" >&2
+        verify_counts_saw_row_decrease=1
         if [ "$fail" -ne 1 ]; then
           fail=1
           verify_counts_failure_reason="post-flatten row count decreased"
@@ -782,6 +792,7 @@ verify_counts() {
       else
         printf 'compact: db=%s table=%s value hash changed after flatten without row-count increase before=%s after=%s — quarantine and investigate before GC\n' \
           "$db" "$t" "$expected_hash" "$actual_hash" >&2
+        verify_counts_saw_same_count_hash_drift=1
         if [ "$fail" -ne 1 ]; then
           fail=1
           verify_counts_failure_reason="post-flatten table value hash changed without row-count increase"
@@ -792,6 +803,7 @@ verify_counts() {
   done < "$preflight"
   post_tables_tmp=$(mktemp)
   if ! user_tables "$db" > "$post_tables_tmp"; then
+    verify_counts_saw_probe_failure=1
     if [ "$fail" -eq 0 ]; then
       fail=2
       verify_counts_failure_reason="post-flatten table list probe failed"
@@ -805,6 +817,7 @@ verify_counts() {
     if ! valid_table_name "$post_table"; then
       printf 'compact: db=%s invalid table name after flatten table=%s — quarantine and investigate before GC\n' \
         "$db" "$post_table" >&2
+      verify_counts_saw_table_list_change=1
       if [ "$fail" -ne 1 ]; then
         fail=1
         verify_counts_failure_reason="post-flatten table list changed"
@@ -817,6 +830,7 @@ verify_counts() {
       *)
         printf 'compact: db=%s table=%s appeared after pre-flight snapshot — quarantine and investigate before GC\n' \
           "$db" "$post_table" >&2
+        verify_counts_saw_table_list_change=1
         if [ "$fail" -ne 1 ]; then
           fail=1
           verify_counts_failure_reason="post-flatten table list changed"
@@ -1302,6 +1316,10 @@ flatten_database() {
   db="$1"
   verify_counts_saw_gain=0
   verify_counts_saw_gain_hash_drift=0
+  verify_counts_saw_row_decrease=0
+  verify_counts_saw_same_count_hash_drift=0
+  verify_counts_saw_table_list_change=0
+  verify_counts_saw_probe_failure=0
   verify_counts_failure_reason=""
   verify_counts_failure_guidance=""
   head_before_reset=""
@@ -1734,7 +1752,11 @@ flatten_database() {
     # gain+drift case with a stable HEAD still quarantine below unchanged.
     if [ "$writer_race_detected" = "1" ] && \
        [ "${verify_counts_saw_gain:-0}" = "1" ] && \
-       [ "${verify_counts_saw_gain_hash_drift:-0}" = "1" ]; then
+       [ "${verify_counts_saw_gain_hash_drift:-0}" = "1" ] && \
+       [ "${verify_counts_saw_row_decrease:-0}" != "1" ] && \
+       [ "${verify_counts_saw_same_count_hash_drift:-0}" != "1" ] && \
+       [ "${verify_counts_saw_table_list_change:-0}" != "1" ] && \
+       [ "${verify_counts_saw_probe_failure:-0}" != "1" ]; then
       printf 'compact: db=%s writer race detected during flatten (snapshot_HEAD=%s pre_reset_HEAD=%s flatten_HEAD=%s post_verify_HEAD=%s) — table value hash drift with row-count increase is concurrent-writer data, not corruption; deferring, will retry next run\n' \
         "$db" "$head" "${head_before_reset:-<empty>}" "$flatten_head" "${post_verify_head:-<empty>}" >&2
       if ! defer_writer_race_after_flatten "$db" "$flatten_head" \
@@ -1745,6 +1767,11 @@ flatten_database() {
       fi
       rm -f "$preflight_tmp"
       return 0
+    fi
+    if [ "$writer_race_detected" = "1" ] && \
+       [ "${verify_counts_saw_gain_hash_drift:-0}" = "1" ]; then
+      printf 'compact: db=%s writer race detected during flatten (snapshot_HEAD=%s pre_reset_HEAD=%s flatten_HEAD=%s post_verify_HEAD=%s), but additional integrity failure category prevents defer; quarantine unchanged\n' \
+        "$db" "$head" "${head_before_reset:-<empty>}" "$flatten_head" "${post_verify_head:-<empty>}" >&2
     fi
     printf 'compact: db=%s post-flatten INTEGRITY check failed — escalate (%s)\n' \
       "$db" "$integrity_guidance" >&2
@@ -1795,6 +1822,9 @@ flatten_database() {
   fi
   if [ "$postflight_hash" != "$preflight_hash" ]; then
     if [ "$db_hash_writer_race_detected" = "1" ]; then
+      # The DB hash probe runs after table-level verification has already
+      # passed. HEAD movement across this probe means an external writer may
+      # have changed any value without changing the checked table row counts.
       db_hash_drift_detail="database value hash drift"
       if [ "${verify_counts_saw_gain:-0}" = "1" ]; then
         db_hash_drift_detail="database value hash drift with row-count increase"

@@ -562,7 +562,7 @@ case "$query" in
     # probe, which reports writercommit so HEAD has moved past the flatten's own
     # commit. verify_counts still sees compactcommit (gain+drift) because it does
     # not probe HEAD and the "$(current_head)" gates read the real state.
-    if { [ "$mode" = "writer_race_during_verify" ] || [ "$mode" = "writer_race_db_hash_during_verify" ]; } && [ "$(current_head)" = "compactcommit" ]; then
+    if { [ "$mode" = "writer_race_during_verify" ] || [ "$mode" = "writer_race_db_hash_during_verify" ] || [ "$mode" = "writer_race_with_mixed_same_count_hash_drift" ]; } && [ "$(current_head)" = "compactcommit" ]; then
       calls_file="$state_file.postverify-head-calls"
       calls=0
       if [ -f "$calls_file" ]; then
@@ -620,7 +620,7 @@ case "$query" in
       print_cell ""
       exit 0
     fi
-    if { [ "$mode" = "row_count_and_hash_diverges" ] || [ "$mode" = "same_table_replacement_with_row_gain" ] || [ "$mode" = "mixed_row_count_gain_and_same_count_hash_drift" ] || [ "$mode" = "writer_race_before_flatten" ] || [ "$mode" = "writer_race_during_verify" ]; } && [ "$(current_head)" = "compactcommit" ]; then
+    if { [ "$mode" = "row_count_and_hash_diverges" ] || [ "$mode" = "same_table_replacement_with_row_gain" ] || [ "$mode" = "mixed_row_count_gain_and_same_count_hash_drift" ] || [ "$mode" = "writer_race_before_flatten" ] || [ "$mode" = "writer_race_during_verify" ] || [ "$mode" = "writer_race_with_mixed_same_count_hash_drift" ]; } && [ "$(current_head)" = "compactcommit" ]; then
       print_cell hash-beads-after-writer
       exit 0
     fi
@@ -632,7 +632,7 @@ case "$query" in
     exit 0
     ;;
   *"DOLT_HASHOF_TABLE('notes')"*)
-    if { [ "$mode" = "mixed_row_count_gain_and_same_count_hash_drift" ] || [ "$mode" = "same_count_hash_drift_then_probe_failure" ] || [ "$mode" = "probe_failure_then_same_count_hash_drift" ]; } && [ "$(current_head)" = "compactcommit" ]; then
+    if { [ "$mode" = "mixed_row_count_gain_and_same_count_hash_drift" ] || [ "$mode" = "writer_race_with_mixed_same_count_hash_drift" ] || [ "$mode" = "same_count_hash_drift_then_probe_failure" ] || [ "$mode" = "probe_failure_then_same_count_hash_drift" ]; } && [ "$(current_head)" = "compactcommit" ]; then
       print_cell hash-notes-after-writer
       exit 0
     fi
@@ -668,7 +668,7 @@ case "$query" in
       print_cell blocked_issues
       exit 0
     fi
-    if [ "$mode" = "mixed_row_count_gain_and_same_count_hash_drift" ]; then
+    if [ "$mode" = "mixed_row_count_gain_and_same_count_hash_drift" ] || [ "$mode" = "writer_race_with_mixed_same_count_hash_drift" ]; then
       print_cells beads notes
       exit 0
     fi
@@ -712,7 +712,7 @@ case "$query" in
       printf 'row count exploded after flatten\n' >&2
       exit 47
     fi
-    if { [ "$mode" = "row_count_gain_with_stable_hashes" ] || [ "$mode" = "row_count_gain_with_db_hash_drift" ] || [ "$mode" = "row_count_and_hash_diverges" ] || [ "$mode" = "same_table_replacement_with_row_gain" ] || [ "$mode" = "mixed_row_count_gain_and_same_count_hash_drift" ] || [ "$mode" = "writer_race_before_flatten" ] || [ "$mode" = "writer_race_during_verify" ] || [ "$mode" = "writer_race_db_hash_during_verify" ]; } && [ "$calls" -gt 1 ]; then
+    if { [ "$mode" = "row_count_gain_with_stable_hashes" ] || [ "$mode" = "row_count_gain_with_db_hash_drift" ] || [ "$mode" = "row_count_and_hash_diverges" ] || [ "$mode" = "same_table_replacement_with_row_gain" ] || [ "$mode" = "mixed_row_count_gain_and_same_count_hash_drift" ] || [ "$mode" = "writer_race_before_flatten" ] || [ "$mode" = "writer_race_during_verify" ] || [ "$mode" = "writer_race_db_hash_during_verify" ] || [ "$mode" = "writer_race_with_mixed_same_count_hash_drift" ]; } && [ "$calls" -gt 1 ]; then
       print_cell 11
     elif [ "$mode" = "row_count_decreases" ] && [ "$calls" -gt 1 ]; then
       print_cell 9
@@ -1839,6 +1839,37 @@ func TestCompactScriptQuarantinesMixedRowGainAndSameCountHashDriftBeforeFullGC(t
 	marker := filepath.Join(fixture.cityPath, ".gc", "runtime", "packs", "dolt", "compact-quarantine", "beads")
 	if reason := compactMarkerValue(t, marker, "reason"); reason != "post-flatten table value hash changed with row-count increase" {
 		t.Fatalf("quarantine reason should identify first table hash drift, got %q", reason)
+	}
+}
+
+func TestCompactScriptQuarantinesMixedSignalsDespiteWriterRace(t *testing.T) {
+	fixture := newCompactScriptFixture(t)
+	out, err := fixture.run(t, "writer_race_with_mixed_same_count_hash_drift", "GC_DOLT_COMPACT_THRESHOLD_COMMITS=500")
+	if err == nil {
+		t.Fatalf("compact succeeded despite proven writer plus same-count hash drift:\n%s", out)
+	}
+	if !strings.Contains(out, "writer race detected") {
+		t.Fatalf("output missing proven writer evidence:\n%s", out)
+	}
+	if !strings.Contains(out, "table=beads gained rows during flatten") ||
+		!strings.Contains(out, "table=notes value hash changed after flatten without row-count increase") {
+		t.Fatalf("output missing mixed integrity signals:\n%s", out)
+	}
+	logData, err := os.ReadFile(fixture.doltLog)
+	if err != nil {
+		t.Fatalf("read dolt log: %v", err)
+	}
+	log := string(logData)
+	if strings.Contains(log, "DOLT_GC") {
+		t.Fatalf("mixed hard integrity signals must block full GC despite writer race:\n%s", log)
+	}
+	quarantine := filepath.Join(fixture.cityPath, ".gc", "runtime", "packs", "dolt", "compact-quarantine", "beads")
+	if _, err := os.Stat(quarantine); err != nil {
+		t.Fatalf("mixed hard integrity signals should write quarantine marker: %v", err)
+	}
+	pendingGC := filepath.Join(fixture.cityPath, ".gc", "runtime", "packs", "dolt", "compact-pending-gc", "beads")
+	if _, err := os.Stat(pendingGC); !os.IsNotExist(err) {
+		t.Fatalf("mixed hard integrity signals must not write pending-GC marker; stat=%v", err)
 	}
 }
 
