@@ -599,6 +599,12 @@ case "$query" in
       print_cell ""
       exit 0
     fi
+    if [ "$mode" = "writer_race_after_postverify_before_db_hash" ] && [ "$(current_head)" = "compactcommit" ]; then
+      set_head writercommit
+      set_hash hash-after-writer
+      print_cell hash-after-writer
+      exit 0
+    fi
     # row_count_gain_with_stable_hashes models the narrow probe-ordering race
     # where the preflight row count is stale but the preflight value hashes
     # already match the post-flatten values.
@@ -761,6 +767,7 @@ case "$query" in
       printf 'gc exploded\n' >&2
       exit 45
     fi
+    rm -rf -- "${GC_DOLT_DATA_DIR:-}/$db/.dolt/noms/oldgen"
     exit 0
     ;;
   *"DOLT_PUSH('--force', '--set-upstream', 'origin', 'main')"*)
@@ -1852,6 +1859,10 @@ func assertCompactWriterRaceDeferred(t *testing.T, fixture compactScriptFixture,
 	if _, statErr := os.Stat(quarantine); !os.IsNotExist(statErr) {
 		t.Fatalf("writer-race defer must NOT write a quarantine marker; stat=%v", statErr)
 	}
+	pendingGC := filepath.Join(fixture.cityPath, ".gc", "runtime", "packs", "dolt", "compact-pending-gc", "beads")
+	if reason := compactMarkerValue(t, pendingGC, "reason"); reason != "writer race during flatten deferred full GC" {
+		t.Fatalf("writer-race defer should record pending-GC retry marker, got reason %q", reason)
+	}
 	data, readErr := os.ReadFile(fixture.doltLog)
 	if readErr != nil {
 		t.Fatalf("read dolt log: %v", readErr)
@@ -1910,6 +1921,76 @@ func TestCompactScriptDefersWhenWriterCommitsCausingDatabaseHashDrift(t *testing
 		t.Fatalf("defer message should report HEAD moving past the flatten commit:\n%s", out)
 	}
 	assertCompactWriterRaceDeferred(t, fixture, out, err)
+}
+
+func TestCompactScriptDefersWhenWriterCommitsDuringDatabaseHash(t *testing.T) {
+	fixture := newCompactScriptFixture(t)
+	out, err := fixture.run(t, "writer_race_after_postverify_before_db_hash", "GC_DOLT_COMPACT_THRESHOLD_COMMITS=500")
+	if !strings.Contains(out, "database value hash drift") {
+		t.Fatalf("output missing database-hash drift evidence:\n%s", out)
+	}
+	if !strings.Contains(out, "post_db_hash_HEAD=writercommit") {
+		t.Fatalf("defer message should report HEAD moving across the database hash probe:\n%s", out)
+	}
+	assertCompactWriterRaceDeferred(t, fixture, out, err)
+}
+
+func TestCompactScriptRetriesPendingGCAfterWriterRaceDefer(t *testing.T) {
+	fixture := newCompactScriptFixture(t)
+	oldgenFile := filepath.Join(fixture.dataDir, "beads", ".dolt", "noms", "oldgen", "archive")
+	if err := os.MkdirAll(filepath.Dir(oldgenFile), 0o755); err != nil {
+		t.Fatalf("mkdir oldgen fixture: %v", err)
+	}
+	if err := os.WriteFile(oldgenFile, []byte("orphaned oldgen data"), 0o644); err != nil {
+		t.Fatalf("write oldgen fixture: %v", err)
+	}
+
+	firstOut, err := fixture.run(t, "writer_race_during_verify", "GC_DOLT_COMPACT_THRESHOLD_COMMITS=500")
+	assertCompactWriterRaceDeferred(t, fixture, firstOut, err)
+	pendingGC := filepath.Join(fixture.cityPath, ".gc", "runtime", "packs", "dolt", "compact-pending-gc", "beads")
+	if compactedFrom := compactMarkerValue(t, pendingGC, "compacted_from_head"); compactedFrom != "headcommit" {
+		t.Fatalf("pending-GC marker should preserve compaction source HEAD, got %q", compactedFrom)
+	}
+
+	secondOut, err := fixture.run(t, "below_threshold")
+	if err != nil {
+		t.Fatalf("second compact should retry pending-GC path:\n%s", secondOut)
+	}
+	if !strings.Contains(secondOut, "pending_gc=present") {
+		t.Fatalf("second compact missing pending-GC retry explanation:\n%s", secondOut)
+	}
+	logData, err := os.ReadFile(fixture.doltLog)
+	if err != nil {
+		t.Fatalf("read dolt log: %v", err)
+	}
+	log := string(logData)
+	if strings.Count(log, "DOLT_GC") != 1 {
+		t.Fatalf("writer-race defer should skip GC once, then run full GC on retry:\n%s", log)
+	}
+	if strings.Count(log, "DOLT_RESET") != 1 {
+		t.Fatalf("pending-GC retry must not flatten again:\n%s", log)
+	}
+	if _, err := os.Stat(oldgenFile); !os.IsNotExist(err) {
+		t.Fatalf("successful pending-GC retry should reclaim oldgen fixture, stat err=%v", err)
+	}
+	if _, err := os.Stat(pendingGC); !os.IsNotExist(err) {
+		t.Fatalf("successful pending-GC retry should clear marker, stat err=%v", err)
+	}
+}
+
+func TestCompactScriptWriterRaceGateUsesFlagNotReasonText(t *testing.T) {
+	sourcePath := filepath.Join(repoRoot(t), "commands", "compact", "run.sh")
+	data, err := os.ReadFile(sourcePath)
+	if err != nil {
+		t.Fatalf("read compact script: %v", err)
+	}
+	source := string(data)
+	if !strings.Contains(source, "verify_counts_saw_gain_hash_drift=1") {
+		t.Fatalf("writer-race gate needs a dedicated gain+hash-drift flag")
+	}
+	if strings.Contains(source, `verify_counts_failure_reason" = "post-flatten table value hash changed with row-count increase"`) {
+		t.Fatalf("writer-race gate must not depend on the human-readable failure reason")
+	}
 }
 
 // Control: the same gain+drift signal with a STABLE HEAD (no writer proven) is a
