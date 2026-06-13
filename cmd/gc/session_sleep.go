@@ -140,6 +140,38 @@ func pendingInteractionKeepsAwake(session beads.Bead, sp runtime.Provider, name 
 	return !view.HasBlocker(sessionpkg.BlockerHeld) && !view.HasBlocker(sessionpkg.BlockerQuarantined)
 }
 
+// reconcilePendingInteractionAt stamps pending_interaction_at (RFC3339) on the
+// session bead the first time a pending-interactive hold is observed, and clears
+// it once the hold resolves. It writes only on the pending<->not-pending
+// transition (no steady-state churn). This is the cheap TTL input the
+// orphan-release backstop (releaseOrphanedPoolAssignmentsWithProvider) reads to
+// bound how long a live pending holder's claim is protected — see #3453.
+func reconcilePendingInteractionAt(session *beads.Bead, store beads.Store, sp runtime.Provider, name string, clk clock.Clock) {
+	if session == nil || store == nil {
+		return
+	}
+	pending := pendingInteractionReady(sp, name)
+	existing := strings.TrimSpace(session.Metadata["pending_interaction_at"])
+	switch {
+	case pending && existing == "":
+		ts := clk.Now().UTC().Format(time.RFC3339)
+		if err := store.SetMetadata(session.ID, "pending_interaction_at", ts); err != nil {
+			log.Printf("session sleep: stamping pending_interaction_at for %s: %v", session.ID, err)
+			return
+		}
+		if session.Metadata == nil {
+			session.Metadata = make(map[string]string, 1)
+		}
+		session.Metadata["pending_interaction_at"] = ts
+	case !pending && existing != "":
+		if err := store.SetMetadata(session.ID, "pending_interaction_at", ""); err != nil {
+			log.Printf("session sleep: clearing pending_interaction_at for %s: %v", session.ID, err)
+			return
+		}
+		session.Metadata["pending_interaction_at"] = ""
+	}
+}
+
 func reconcileDetachedAt(
 	session *beads.Bead,
 	store beads.Store,

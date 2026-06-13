@@ -635,6 +635,8 @@ func TestReleaseOrphanedPoolAssignmentsWhenSnapshotsComplete_PartialSkipsComplet
 			StoreQueryPartial:  true,
 		},
 		nil,
+		nil,
+		nil,
 	)
 	if len(released) != 0 {
 		t.Fatalf("released %d work bead(s) from a partial snapshot, want none", len(released))
@@ -658,6 +660,8 @@ func TestReleaseOrphanedPoolAssignmentsWhenSnapshotsComplete_PartialSkipsComplet
 			SessionQueryPartial: true,
 		},
 		nil,
+		nil,
+		nil,
 	)
 	if len(released) != 0 {
 		t.Fatalf("released %d work bead(s) from a partial session snapshot, want none", len(released))
@@ -679,6 +683,8 @@ func TestReleaseOrphanedPoolAssignmentsWhenSnapshotsComplete_PartialSkipsComplet
 			AssignedWorkBeads:  []beads.Bead{work},
 			AssignedWorkStores: []beads.Store{store},
 		},
+		nil,
+		nil,
 		nil,
 	)
 	if len(released) != 1 {

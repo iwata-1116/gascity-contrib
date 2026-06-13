@@ -1765,6 +1765,7 @@ func reconcileSessionBeadsTracedWithNamedDemand(
 			alive = false
 		}
 		reconcileDetachedAt(session, store, policy, alive, sp, clk)
+		reconcilePendingInteractionAt(session, store, sp, name, clk)
 
 		// Stability check: detect rapid crash after state healing. Rate-limit
 		// detection intentionally ran above before healState.

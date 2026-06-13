@@ -6,9 +6,12 @@ import (
 	"log"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/gastownhall/gascity/internal/beads"
+	"github.com/gastownhall/gascity/internal/clock"
 	"github.com/gastownhall/gascity/internal/config"
+	"github.com/gastownhall/gascity/internal/runtime"
 )
 
 const testDetachedPoolProbeSpec = "tmux:gascity:soak-loop"
@@ -1913,5 +1916,174 @@ func TestReleaseOrphanedPoolAssignments_PreservesNamedIdentityForSameStore(t *te
 	}
 	if got.Assignee != "reviewer" {
 		t.Fatalf("assignee = %q, want reviewer", got.Assignee)
+	}
+}
+
+// pendingHolderFixture builds the store + open-session snapshot for the #3453
+// pending-interactive backstop tests: a pool work bead claimed by "worker-mc-live"
+// whose holder session bead is present in the open snapshot but absent from the
+// store's live-session query (simulating the store-ref-scoped openSessionOwnsWork
+// miss / label-lost liveness query that lets the race reach the release path).
+func pendingHolderFixture(t *testing.T) (beads.Store, beads.Bead, beads.Bead) {
+	t.Helper()
+	store := beads.NewMemStore()
+	work, err := store.Create(beads.Bead{
+		Title:    "claimed pool work",
+		Assignee: "worker-mc-live",
+		Metadata: map[string]string{"gc.routed_to": "worker"},
+	})
+	if err != nil {
+		t.Fatalf("Create work bead: %v", err)
+	}
+	if err := store.Update(work.ID, beads.UpdateOpts{Status: stringPtr("in_progress")}); err != nil {
+		t.Fatalf("Set work status: %v", err)
+	}
+	work, err = store.Get(work.ID)
+	if err != nil {
+		t.Fatalf("Reload work bead: %v", err)
+	}
+	holder := beads.Bead{
+		ID:     "mc-live",
+		Title:  "worker",
+		Type:   sessionBeadType,
+		Status: "open",
+		Labels: []string{sessionBeadLabel},
+		Metadata: map[string]string{
+			"session_name":         "worker-mc-live",
+			"template":             "worker",
+			"state":                "active",
+			poolManagedMetadataKey: boolMetadata(true),
+		},
+	}
+	return store, work, holder
+}
+
+func releasePendingTestCfg() *config.City {
+	return &config.City{Agents: []config.Agent{{Name: "worker", MinActiveSessions: intPtr(0), MaxActiveSessions: intPtr(2)}}}
+}
+
+func TestReleaseOrphanedPoolAssignments_SkipsPendingInteractiveHolder(t *testing.T) {
+	store, work, holder := pendingHolderFixture(t)
+	sp := &attachmentAwareProvider{
+		Fake:    runtime.NewFake(),
+		pending: &runtime.PendingInteraction{RequestID: "req-1", Kind: "approval"},
+	}
+	clk := &clock.Fake{Time: time.Date(2026, 6, 13, 12, 0, 0, 0, time.UTC)}
+
+	released := releaseOrphanedPoolAssignmentsWithProvider(
+		store,
+		releasePendingTestCfg(),
+		"",
+		[]beads.Bead{holder},
+		[]beads.Bead{work},
+		[]beads.Store{store},
+		[]string{"rig:other"}, // store-ref mismatch -> openSessionOwnsWork=false
+		nil,
+		sp,
+		clk,
+	)
+	if len(released) != 0 {
+		t.Fatalf("released = %v, want none — live pending-interactive holder owns the work", released)
+	}
+	got, err := store.Get(work.ID)
+	if err != nil {
+		t.Fatalf("Get work bead: %v", err)
+	}
+	if got.Status != "in_progress" || got.Assignee != "worker-mc-live" {
+		t.Fatalf("pending holder work was released: status=%q assignee=%q", got.Status, got.Assignee)
+	}
+}
+
+func TestReleaseOrphanedPoolAssignments_ReleasesWhenHolderNotPending(t *testing.T) {
+	store, work, holder := pendingHolderFixture(t)
+	// Provider reports no pending interaction: a genuinely dead/idle pane is
+	// released exactly as before the backstop existed.
+	sp := &attachmentAwareProvider{Fake: runtime.NewFake()}
+	clk := &clock.Fake{Time: time.Date(2026, 6, 13, 12, 0, 0, 0, time.UTC)}
+
+	released := releaseOrphanedPoolAssignmentsWithProvider(
+		store,
+		releasePendingTestCfg(),
+		"",
+		[]beads.Bead{holder},
+		[]beads.Bead{work},
+		[]beads.Store{store},
+		[]string{"rig:other"},
+		nil,
+		sp,
+		clk,
+	)
+	if len(released) != 1 || released[0].ID != work.ID {
+		t.Fatalf("released = %v, want [%s] — non-pending holder must release", released, work.ID)
+	}
+	got, err := store.Get(work.ID)
+	if err != nil {
+		t.Fatalf("Get work bead: %v", err)
+	}
+	if got.Status != "open" || got.Assignee != "" {
+		t.Fatalf("non-pending holder work not released: status=%q assignee=%q", got.Status, got.Assignee)
+	}
+}
+
+func TestReleaseOrphanedPoolAssignments_ReleasesPendingHolderPastBackstop(t *testing.T) {
+	store, work, holder := pendingHolderFixture(t)
+	clk := &clock.Fake{Time: time.Date(2026, 6, 13, 12, 0, 0, 0, time.UTC)}
+	// Pane has been parked pending longer than orphanReleasePendingBackstop:
+	// a pane stuck pending forever is a zombie and must still be recovered.
+	holder.Metadata["pending_interaction_at"] = clk.Now().Add(-4 * time.Hour).UTC().Format(time.RFC3339)
+	sp := &attachmentAwareProvider{
+		Fake:    runtime.NewFake(),
+		pending: &runtime.PendingInteraction{RequestID: "req-1", Kind: "approval"},
+	}
+
+	released := releaseOrphanedPoolAssignmentsWithProvider(
+		store,
+		releasePendingTestCfg(),
+		"",
+		[]beads.Bead{holder},
+		[]beads.Bead{work},
+		[]beads.Store{store},
+		[]string{"rig:other"},
+		nil,
+		sp,
+		clk,
+	)
+	if len(released) != 1 || released[0].ID != work.ID {
+		t.Fatalf("released = %v, want [%s] — pending hold past backstop must release", released, work.ID)
+	}
+	got, err := store.Get(work.ID)
+	if err != nil {
+		t.Fatalf("Get work bead: %v", err)
+	}
+	if got.Status != "open" || got.Assignee != "" {
+		t.Fatalf("stale pending holder work not released: status=%q assignee=%q", got.Status, got.Assignee)
+	}
+}
+
+func TestOrphanReleasePendingBackstopExpired(t *testing.T) {
+	now := time.Date(2026, 6, 13, 12, 0, 0, 0, time.UTC)
+	clk := &clock.Fake{Time: now}
+	mk := func(ts string) beads.Bead {
+		return beads.Bead{Metadata: map[string]string{"pending_interaction_at": ts}}
+	}
+	tests := []struct {
+		name    string
+		session beads.Bead
+		clk     clock.Clock
+		want    bool
+	}{
+		{"just under backstop holds", mk(now.Add(-(orphanReleasePendingBackstop - time.Minute)).Format(time.RFC3339)), clk, false},
+		{"just past backstop expires", mk(now.Add(-(orphanReleasePendingBackstop + time.Minute)).Format(time.RFC3339)), clk, true},
+		{"exactly at backstop expires", mk(now.Add(-orphanReleasePendingBackstop).Format(time.RFC3339)), clk, true},
+		{"unstamped treated as fresh", beads.Bead{}, clk, false},
+		{"unparseable treated as fresh", mk("not-a-timestamp"), clk, false},
+		{"nil clock fails closed", mk(now.Add(-4 * time.Hour).Format(time.RFC3339)), nil, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := orphanReleasePendingBackstopExpired(tt.session, tt.clk); got != tt.want {
+				t.Fatalf("orphanReleasePendingBackstopExpired = %v, want %v", got, tt.want)
+			}
+		})
 	}
 }

@@ -9,10 +9,19 @@ import (
 
 	"github.com/gastownhall/gascity/internal/agent"
 	"github.com/gastownhall/gascity/internal/beads"
+	"github.com/gastownhall/gascity/internal/clock"
 	"github.com/gastownhall/gascity/internal/config"
+	"github.com/gastownhall/gascity/internal/runtime"
 	"github.com/gastownhall/gascity/internal/session"
 	"github.com/gastownhall/gascity/internal/sling"
 )
+
+// orphanReleasePendingBackstop bounds how long the pending-interactive guard
+// (#3453) defers orphan release. A holder parked on an interactive prompt keeps
+// its claim, but a pane stuck pending forever (a true zombie that never gets
+// input) is released once the hold is older than this, so abandoned work still
+// recovers.
+const orphanReleasePendingBackstop = 3 * time.Hour
 
 // sessionBeadAssigneeIdentities returns every identifier under which a work
 // bead could be assigned to this session: the session bead ID, session_name,
@@ -86,6 +95,8 @@ func releaseOrphanedPoolAssignmentsWhenSnapshotsComplete(
 	openSessionBeads []beads.Bead,
 	result DesiredStateResult,
 	rigStores map[string]beads.Store,
+	sp runtime.Provider,
+	clk clock.Clock,
 ) []releasedPoolAssignment {
 	// Partial input snapshots can make active work look orphaned for this
 	// tick only: missing work affects drain decisions, and missing sessions
@@ -93,13 +104,18 @@ func releaseOrphanedPoolAssignmentsWhenSnapshotsComplete(
 	if result.snapshotQueryPartial() {
 		return nil
 	}
-	return releaseOrphanedPoolAssignments(store, cfg, cityPath, openSessionBeads, result.AssignedWorkBeads, result.AssignedWorkStores, result.AssignedWorkStoreRefs, rigStores)
+	return releaseOrphanedPoolAssignmentsWithProvider(store, cfg, cityPath, openSessionBeads, result.AssignedWorkBeads, result.AssignedWorkStores, result.AssignedWorkStoreRefs, rigStores, sp, clk)
 }
 
 // releaseOrphanedPoolAssignments reopens active pool-routed work whose
 // assignee no longer maps to any open session bead. This also recovers
 // pool-routed work left in_progress with no assignee, which cannot be claimed
 // again until it is moved back to open.
+//
+// This nil-provider entry preserves the original behavior (the
+// pending-interactive backstop is disabled without a runtime provider). The
+// daemon path threads a real provider + clock via
+// releaseOrphanedPoolAssignmentsWithProvider.
 func releaseOrphanedPoolAssignments(
 	store beads.Store,
 	cfg *config.City,
@@ -109,6 +125,27 @@ func releaseOrphanedPoolAssignments(
 	assignedWorkStores []beads.Store,
 	assignedWorkStoreRefs []string,
 	rigStores map[string]beads.Store,
+) []releasedPoolAssignment {
+	return releaseOrphanedPoolAssignmentsWithProvider(store, cfg, cityPath, openSessionBeads, assignedWorkBeads, assignedWorkStores, assignedWorkStoreRefs, rigStores, nil, nil)
+}
+
+// releaseOrphanedPoolAssignmentsWithProvider is releaseOrphanedPoolAssignments
+// with the pending-interactive backstop (#3453): when sp is non-nil it skips
+// release for a holder whose pane is still alive and parked on an interactive
+// prompt (within orphanReleasePendingBackstop), so a transiently-unowned claim
+// is not cleared out from under a live, intentionally-waiting session — which
+// would let demand reappear and spawn a duplicate worker on the same bead.
+func releaseOrphanedPoolAssignmentsWithProvider(
+	store beads.Store,
+	cfg *config.City,
+	cityPath string,
+	openSessionBeads []beads.Bead,
+	assignedWorkBeads []beads.Bead,
+	assignedWorkStores []beads.Store,
+	assignedWorkStoreRefs []string,
+	rigStores map[string]beads.Store,
+	sp runtime.Provider,
+	clk clock.Clock,
 ) []releasedPoolAssignment {
 	if store == nil || cfg == nil || len(assignedWorkBeads) == 0 {
 		return nil
@@ -124,12 +161,16 @@ func releaseOrphanedPoolAssignments(
 
 	openIdentifiers := makeOpenSessionStoreRefIndex(cityPath, cfg, openSessionBeads, storeRefAware)
 	legacyOpenIdentifiers := make(map[string]struct{}, len(openSessionBeads)*5)
+	openSessionByIdentity := make(map[string]beads.Bead, len(openSessionBeads)*5)
 	for _, sb := range openSessionBeads {
 		if sb.Status == "closed" {
 			continue
 		}
 		for _, id := range sessionBeadAssigneeIdentities(sb) {
 			legacyOpenIdentifiers[id] = struct{}{}
+			if _, exists := openSessionByIdentity[id]; !exists {
+				openSessionByIdentity[id] = sb
+			}
 		}
 	}
 
@@ -163,6 +204,16 @@ func releaseOrphanedPoolAssignments(
 				continue
 			}
 			if liveOpenSessionAssignmentExists(store, assignee) {
+				continue
+			}
+			// Pending-interactive backstop (#3453): the ownership/liveness
+			// checks above can transiently miss a holder whose pane is alive but
+			// parked on an interactive prompt (e.g. store-ref-scoped
+			// openSessionOwnsWork=false, or a label-lost session bead). Confirm
+			// with the runtime provider before clearing the claim — releasing a
+			// live, intentionally-waiting holder lets demand reappear and spawns
+			// a duplicate worker on the same bead.
+			if pendingInteractiveHolderBlocksRelease(openSessionByIdentity, assignee, sp, clk) {
 				continue
 			}
 		}
@@ -464,6 +515,50 @@ func assigneePreservesNamedSessionRoute(cfg *config.City, cityPath, template, as
 		return true
 	}
 	return assignedWorkStoreRefForAgent(cityPath, cfg, spec.Agent) == workStoreRef
+}
+
+// pendingInteractiveHolderBlocksRelease reports whether the open-session holder
+// of this assignee is alive and parked on an interactive prompt, within the
+// orphanReleasePendingBackstop window. A nil provider disables the backstop
+// (pendingInteractionKeepsAwake returns false), preserving the original release
+// behavior. The runtime probe is authoritative about liveness: a genuinely dead
+// pane reports not-pending and is released as before.
+func pendingInteractiveHolderBlocksRelease(openSessionByIdentity map[string]beads.Bead, assignee string, sp runtime.Provider, clk clock.Clock) bool {
+	holder, ok := openSessionByIdentity[strings.TrimSpace(assignee)]
+	if !ok {
+		return false
+	}
+	name := strings.TrimSpace(holder.Metadata["session_name"])
+	if !pendingInteractionKeepsAwake(holder, sp, name, clk) {
+		return false
+	}
+	if orphanReleasePendingBackstopExpired(holder, clk) {
+		return false
+	}
+	// Mirror the sibling detached-probe path, which logs every skip/release
+	// decision: make the duplicate-suppression observable.
+	log.Printf("releaseOrphanedPoolAssignments: skipping release: holder %s pending-interactive for assignee %q", name, assignee)
+	return true
+}
+
+// orphanReleasePendingBackstopExpired reports whether the holder's pending hold
+// is older than orphanReleasePendingBackstop. An unstamped or unparseable
+// pending_interaction_at is treated as a fresh hold (not expired): the holder is
+// provably pending now, and reconcilePendingInteractionAt stamps the bead so the
+// backstop can fire on a later tick.
+func orphanReleasePendingBackstopExpired(session beads.Bead, clk clock.Clock) bool {
+	if clk == nil {
+		return false
+	}
+	raw := strings.TrimSpace(session.Metadata["pending_interaction_at"])
+	if raw == "" {
+		return false
+	}
+	started, err := time.Parse(time.RFC3339, raw)
+	if err != nil {
+		return false
+	}
+	return clk.Now().Sub(started) >= orphanReleasePendingBackstop
 }
 
 func stringPtr(s string) *string { return &s }

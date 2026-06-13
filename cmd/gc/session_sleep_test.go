@@ -1250,3 +1250,51 @@ func waitForIdleProbeReady(t *testing.T, dt *drainTracker, beadID string) {
 	}
 	t.Fatalf("idle probe for %s not ready within 10s", beadID)
 }
+
+func TestReconcilePendingInteractionAt_StampsThenClears(t *testing.T) {
+	store := beads.NewMemStore()
+	sb, err := store.Create(beads.Bead{
+		Title:    "worker",
+		Type:     sessionBeadType,
+		Status:   "open",
+		Metadata: map[string]string{"session_name": "worker-mc-1"},
+	})
+	if err != nil {
+		t.Fatalf("Create session bead: %v", err)
+	}
+	clk := &clock.Fake{Time: time.Date(2026, 6, 13, 9, 0, 0, 0, time.UTC)}
+
+	// First pending observation stamps the bead.
+	pending := &attachmentAwareProvider{
+		Fake:    runtime.NewFake(),
+		pending: &runtime.PendingInteraction{RequestID: "r1", Kind: "approval"},
+	}
+	reconcilePendingInteractionAt(&sb, store, pending, "worker-mc-1", clk)
+	want := clk.Now().UTC().Format(time.RFC3339)
+	got, err := store.Get(sb.ID)
+	if err != nil {
+		t.Fatalf("Get session bead: %v", err)
+	}
+	if got.Metadata["pending_interaction_at"] != want {
+		t.Fatalf("pending_interaction_at = %q, want %q", got.Metadata["pending_interaction_at"], want)
+	}
+	if sb.Metadata["pending_interaction_at"] != want {
+		t.Fatalf("in-memory bead not updated: %q", sb.Metadata["pending_interaction_at"])
+	}
+
+	// Re-observing pending later does not re-stamp (write only on transition).
+	clk.Time = clk.Time.Add(time.Hour)
+	reconcilePendingInteractionAt(&sb, store, pending, "worker-mc-1", clk)
+	got, _ = store.Get(sb.ID)
+	if got.Metadata["pending_interaction_at"] != want {
+		t.Fatalf("pending_interaction_at re-stamped: got %q, want stable %q", got.Metadata["pending_interaction_at"], want)
+	}
+
+	// Hold resolves: clear the stamp.
+	notPending := &attachmentAwareProvider{Fake: runtime.NewFake()}
+	reconcilePendingInteractionAt(&sb, store, notPending, "worker-mc-1", clk)
+	got, _ = store.Get(sb.ID)
+	if got.Metadata["pending_interaction_at"] != "" {
+		t.Fatalf("pending_interaction_at not cleared: %q", got.Metadata["pending_interaction_at"])
+	}
+}
