@@ -558,7 +558,7 @@ func decorateDynamicFragmentRecipe(fragment *formula.FragmentRecipe, source bead
 	if routingRigContext == "" {
 		routingRigContext = graphRouteRigContext(defaultRoute.QualifiedName)
 	}
-	controlRoute, err := controlDispatcherBinding(store, cityName, cfg, routingRigContext)
+	controlRoute, err := graphroute.ControlDispatcherBinding(store, cityName, cfg, routingRigContext, cliGraphrouteDeps(cityPath))
 	if err != nil {
 		return err
 	}
